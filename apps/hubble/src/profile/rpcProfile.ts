@@ -46,13 +46,14 @@ export async function profileRPCServer(addressString: string, useInsecure: boole
   // Pretty print the results
   console.log("\nRPC Server Profile\n");
   console.log(prettyPrintTable(data));
+
+  rpcClient.close();
 }
 
 async function profileSubmitMessages(
   rpcClient: HubRpcClient,
   adminRpcClient: AdminRpcClient,
   fid: number,
-  network = FarcasterNetwork.DEVNET,
   username?: string | Metadata,
   password?: string,
 ): Promise<string[]> {
@@ -74,6 +75,9 @@ async function profileSubmitMessages(
     metadata = getAuthMetadata(username, password);
   }
 
+  // Make sure the network matches
+  const network = FarcasterNetwork.DEVNET;
+
   const custodySigner = Factories.Eip712Signer.build();
   const custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
   const signer = Factories.Ed25519Signer.build();
@@ -85,15 +89,14 @@ async function profileSubmitMessages(
     throw `Failed to submit custody event for fid ${fid}: ${idResult.error}`;
   }
 
-  const rentRegistryEvent = Factories.RentRegistryEvent.build({
+  const rentRegistryEvent = Factories.StorageRentOnChainEvent.build({
     fid,
-    expiry: getFarcasterTime()._unsafeUnwrap() + 365 * 24 * 60 * 60,
-    units: 2,
+    storageRentEventBody: Factories.StorageRentEventBody.build({ units: 2 }),
   });
-  const rentResult = await adminRpcClient.submitRentRegistryEvent(rentRegistryEvent, metadata);
+  const rentResult = await adminRpcClient.submitOnChainEvent(rentRegistryEvent, metadata);
 
   if (!rentResult.isOk()) {
-    throw `Failed to submit rent event for fid ${fid}: ${rentResult.error}`;
+    throw `Failed to submit rent event for fid ${fid}: ${rentResult.error}. NOTE: RPC profile only works on devnet`;
   }
 
   const signerAdd = await Factories.SignerAddMessage.create(

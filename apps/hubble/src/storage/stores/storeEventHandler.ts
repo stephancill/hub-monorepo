@@ -17,6 +17,8 @@ import {
   MergeUsernameProofHubEvent,
   PruneMessageHubEvent,
   RevokeMessageHubEvent,
+  MergeOnChainEventHubEvent,
+  isMergeOnChainHubEvent,
 } from "@farcaster/hub-nodejs";
 import AbstractRocksDB from "@farcaster/rocksdb";
 import AsyncLock from "async-lock";
@@ -98,6 +100,12 @@ export type StoreEvents = {
    * is merged into the UserDataStore.
    */
   mergeUsernameProofEvent: (event: MergeUsernameProofHubEvent) => void;
+
+  /**
+   * mergeOnChainEvent is emitted when a on chain event is merged into the
+   * OnChainEventStore.
+   */
+  mergeOnChainEvent: (event: MergeOnChainEventHubEvent) => void;
 };
 
 export type HubEventArgs = Omit<HubEvent, "id">;
@@ -191,7 +199,14 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
   }
 
   async getCurrentStorageUnitsForFid(fid: number): HubAsyncResult<number> {
-    return await this._storageCache.getCurrentStorageUnitsForFid(fid);
+    const units = await this._storageCache.getCurrentStorageUnitsForFid(fid);
+
+    if (units.isOk() && units.value === 0) {
+      logger.debug({ fid }, "fid has no registered storage, would be pruned");
+    }
+
+    // This is temporary, when all fids are migrated to using storage rent, we'll just use the units directly.
+    return units.map((u) => (u > 0 ? u : 1));
   }
 
   async getCacheMessageCount(fid: number, set: UserMessagePostfix): HubAsyncResult<number> {
@@ -264,18 +279,12 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
       return err(units.error);
     }
 
-    if (units.value === 0) {
-      logger.debug({ fid: message.data.fid }, "fid has no registered storage, would be pruned");
-    }
-
-    const unitsMultiplier = units.value > 0 ? units.value : 1;
-
     const messageCount = await this.getCacheMessageCount(message.data.fid, set);
     if (messageCount.isErr()) {
       return err(messageCount.error);
     }
 
-    if (messageCount.value < sizeLimit * unitsMultiplier) {
+    if (messageCount.value < sizeLimit * units.value) {
       return ok(false);
     }
 
@@ -356,6 +365,8 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
       this.emit("mergeIdRegistryEvent", event);
     } else if (isMergeUsernameProofHubEvent(event)) {
       this.emit("mergeUsernameProofEvent", event);
+    } else if (isMergeOnChainHubEvent(event)) {
+      this.emit("mergeOnChainEvent", event);
     } else {
       return err(new HubError("bad_request.invalid_param", "invalid event type"));
     }
