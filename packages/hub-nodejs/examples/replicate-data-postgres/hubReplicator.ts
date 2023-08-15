@@ -38,7 +38,7 @@ import { HubSubscriber } from "./hubSubscriber";
 import { Logger } from "pino";
 import { Database } from "./db";
 import { Kysely, sql } from "kysely";
-import { bytesToHex, farcasterTimeToDate } from "./util";
+import { bytesToHex, farcasterTimeToDate, timeSince } from "./util";
 import * as fastq from "fastq";
 import type { queueAsPromised } from "fastq";
 import prettyMilliseconds from "pretty-ms";
@@ -63,7 +63,13 @@ export class HubReplicator {
 
     this.subscriber.on("event", async (hubEvent) => {
       if (isMergeMessageHubEvent(hubEvent)) {
-        this.log.info(`[Sync] Processing merge event ${hubEvent.id} from stream`);
+        const timestamp = hubEvent.mergeMessageBody.message.data?.timestamp;
+        let timeAgoString: string | undefined;
+        if (timestamp) {
+          timeAgoString = timeSince(farcasterTimeToDate(timestamp));
+        }
+
+        this.log.info(`[Sync] Processing merge event ${hubEvent.id} from stream ${timeAgoString ? `(${timeAgoString} ago)` : ""}`);
         await this.onMergeMessages([hubEvent.mergeMessageBody.message]);
         await this.storeMessages(hubEvent.mergeMessageBody.deletedMessages, "delete");
       } else if (isPruneMessageHubEvent(hubEvent)) {
