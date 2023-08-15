@@ -7,7 +7,6 @@ import {
   IdRegistryEvent,
   Message,
   NameRegistryEvent,
-  UpdateNameRegistryEventExpiryJobPayload,
   HubAsyncResult,
   HubError,
   bytesToHexString,
@@ -38,10 +37,6 @@ import { RootPrefix } from "./storage/db/types.js";
 import Engine from "./storage/engine/index.js";
 import { PruneEventsJobScheduler } from "./storage/jobs/pruneEventsJob.js";
 import { PruneMessagesJobScheduler } from "./storage/jobs/pruneMessagesJob.js";
-import {
-  UpdateNameRegistryEventExpiryJobQueue,
-  UpdateNameRegistryEventExpiryJobWorker,
-} from "./storage/jobs/updateNameRegistryEventExpiryJob.js";
 import { sleep } from "./utils/crypto.js";
 import {
   idRegistryEventToLog,
@@ -65,7 +60,6 @@ import { ensureAboveMinFarcasterVersion, VersionSchedule } from "./utils/version
 import { CheckFarcasterVersionJobScheduler } from "./storage/jobs/checkFarcasterVersionJob.js";
 import { ValidateOrRevokeMessagesJobScheduler } from "./storage/jobs/validateOrRevokeMessagesJob.js";
 import { GossipContactInfoJobScheduler } from "./storage/jobs/gossipContactInfoJob.js";
-import { MAINNET_ALLOWED_PEERS } from "./allowedPeers.mainnet.js";
 import { MAINNET_BOOTSTRAP_PEERS } from "./bootstrapPeers.mainnet.js";
 import StoreEventHandler from "./storage/stores/storeEventHandler.js";
 import { FNameRegistryClient, FNameRegistryEventsProvider } from "./eth/fnameRegistryEventsProvider.js";
@@ -79,6 +73,8 @@ import { AddrInfo } from "@chainsafe/libp2p-gossipsub/types";
 import { CheckIncomingPortsJobScheduler } from "./storage/jobs/checkIncomingPortsJob.js";
 import { NetworkConfig, applyNetworkConfig, fetchNetworkConfig } from "./network/utils/networkConfig.js";
 import { UpdateNetworkConfigJobScheduler } from "./storage/jobs/updateNetworkConfigJob.js";
+import { statsd } from "./utils/statsd.js";
+import { LATEST_DB_SCHEMA_VERSION, performDbMigrations } from "./storage/db/migrations/migrations.js";
 
 export type HubSubmitSource = "gossip" | "rpc" | "eth-provider" | "l2-provider" | "sync" | "fname-registry";
 
@@ -280,9 +276,6 @@ export class Hub implements HubInterface {
   private checkIncomingPortsJobScheduler: CheckIncomingPortsJobScheduler;
   private updateNetworkConfigJobScheduler: UpdateNetworkConfigJobScheduler;
 
-  private updateNameRegistryEventExpiryJobQueue: UpdateNameRegistryEventExpiryJobQueue;
-  private updateNameRegistryEventExpiryJobWorker?: UpdateNameRegistryEventExpiryJobWorker;
-
   engine: Engine;
   ethRegistryProvider?: EthEventsProvider;
   fNameRegistryEventsProvider?: FNameRegistryEventsProvider;
@@ -413,9 +406,6 @@ export class Hub implements HubInterface {
     );
     this.adminServer = new AdminServer(this, this.rocksDB, this.engine, this.syncEngine, options.rpcAuth);
 
-    // Setup job queues
-    this.updateNameRegistryEventExpiryJobQueue = new UpdateNameRegistryEventExpiryJobQueue(this.rocksDB);
-
     // Setup job schedulers/workers
     this.pruneMessagesJobScheduler = new PruneMessagesJobScheduler(this.engine);
     this.periodSyncJobScheduler = new PeriodicSyncJobScheduler(this, this.syncEngine);
@@ -430,21 +420,9 @@ export class Hub implements HubInterface {
       this.testDataJobScheduler = new PeriodicTestDataJobScheduler(this.rpcServer, options.testUsers as TestUser[]);
     }
 
-    if (this.ethRegistryProvider) {
-      this.updateNameRegistryEventExpiryJobWorker = new UpdateNameRegistryEventExpiryJobWorker(
-        this.updateNameRegistryEventExpiryJobQueue,
-        this.rocksDB,
-        this.ethRegistryProvider,
-      );
-    }
-
+    // Allowed peers can be undefined, which means permissionless connections
     this.allowedPeerIds = this.options.allowedPeers;
-    if (this.options.network === FarcasterNetwork.MAINNET) {
-      // Mainnet is right now resitrcited to a few peers
-      // Append and de-dup the allowed peers
-      this.allowedPeerIds = [...new Set([...(this.allowedPeerIds ?? []), ...MAINNET_ALLOWED_PEERS])];
-    }
-
+    // Denied peers by default is an empty list
     this.deniedPeerIds = this.options.deniedPeers ?? [];
   }
 
@@ -517,6 +495,28 @@ export class Hub implements HubInterface {
       }
     }
 
+    // Get the DB Schema version
+    const dbSchemaVersion = await this.getDbSchemaVersion();
+    if (dbSchemaVersion > LATEST_DB_SCHEMA_VERSION) {
+      throw new HubError(
+        "unavailable.storage_failure",
+        `DB schema version is unknown. Do you have the right version of Hubble? DB schema version: ${dbSchemaVersion}, latest supported version: ${LATEST_DB_SCHEMA_VERSION}`,
+      );
+    }
+    if (dbSchemaVersion < LATEST_DB_SCHEMA_VERSION) {
+      // We need a migration
+      log.info({ dbSchemaVersion, latestDbSchemaVersion: LATEST_DB_SCHEMA_VERSION }, "DB needs migrations");
+      const success = await performDbMigrations(this.rocksDB, dbSchemaVersion);
+      if (success) {
+        log.info({}, "All DB migrations successful");
+        await this.setDbSchemaVersion(LATEST_DB_SCHEMA_VERSION);
+      } else {
+        throw new HubError("unavailable.storage_failure", "DB migrations failed");
+      }
+    } else {
+      log.info({ dbSchemaVersion, latestDbSchemaVersion: LATEST_DB_SCHEMA_VERSION }, "DB schema is up-to-date");
+    }
+
     // Get the Network ID from the DB
     const dbNetworkResult = await this.getDbNetwork();
     if (dbNetworkResult.isOk() && dbNetworkResult.value && dbNetworkResult.value !== this.options.network) {
@@ -568,10 +568,6 @@ export class Hub implements HubInterface {
 
     // Start the sync engine
     await this.syncEngine.initialize(this.options.rebuildSyncTrie ?? false);
-
-    if (this.updateNameRegistryEventExpiryJobWorker) {
-      this.updateNameRegistryEventExpiryJobWorker.start();
-    }
 
     let bootstrapAddrs = this.options.bootstrapAddrs ?? [];
     // Add mainnet bootstrap addresses if none are provided
@@ -649,8 +645,6 @@ export class Hub implements HubInterface {
       this.gossipNode.updateDeniedPeerIds(deniedPeerIds);
       this.deniedPeerIds = deniedPeerIds;
 
-      log.info({ allowedPeerIds, deniedPeerIds }, "Updated Network Config");
-
       return false;
     }
   }
@@ -699,17 +693,12 @@ export class Hub implements HubInterface {
     // Stop admin, gossip and sync engine
     await Promise.all([this.adminServer.stop(), this.gossipNode.stop(), this.syncEngine.stop()]);
 
-    if (this.updateNameRegistryEventExpiryJobWorker) {
-      this.updateNameRegistryEventExpiryJobWorker.stop();
-    }
-
     // Stop cron tasks
     this.pruneMessagesJobScheduler.stop();
     this.periodSyncJobScheduler.stop();
     this.pruneEventsJobScheduler.stop();
     this.checkFarcasterVersionJobScheduler.stop();
     this.testDataJobScheduler?.stop();
-    this.updateNameRegistryEventExpiryJobWorker?.stop();
     this.validateOrRevokeMessagesJobScheduler.stop();
     this.gossipContactInfoJobScheduler.stop();
     this.checkIncomingPortsJobScheduler.stop();
@@ -1038,6 +1027,8 @@ export class Hub implements HubInterface {
       return err(new HubError("unavailable.storage_failure", "Sync trie queue is full"));
     }
 
+    const start = Date.now();
+
     const mergeResult = await this.engine.mergeMessage(message);
 
     mergeResult.match(
@@ -1058,7 +1049,8 @@ export class Hub implements HubInterface {
         }
       },
       (e) => {
-        logMessage.warn({ errCode: e.errCode }, `submitMessage error: ${e.message}`);
+        logMessage.warn({ errCode: e.errCode, source }, `submitMessage error: ${e.message}`);
+        statsd().increment(`submit_message.error.${source}.${e.errCode}`);
       },
     );
 
@@ -1066,6 +1058,8 @@ export class Hub implements HubInterface {
     if (mergeResult.isOk() && source === "rpc") {
       void this.gossipNode.gossipMessage(message);
     }
+
+    statsd().timing("hub.merge_message", Date.now() - start);
 
     return mergeResult;
   }
@@ -1108,11 +1102,6 @@ export class Hub implements HubInterface {
         logEvent.warn({ errCode: e.errCode }, `submitNameRegistryEvent error: ${e.message}`);
       },
     );
-
-    if (!event.expiry) {
-      const payload = UpdateNameRegistryEventExpiryJobPayload.create({ fname: event.fname });
-      await this.updateNameRegistryEventExpiryJobQueue.enqueueJob(payload);
-    }
 
     return mergeResult;
   }
@@ -1194,6 +1183,33 @@ export class Hub implements HubInterface {
 
     // get the enum value from the number
     return networkNumber.map((n) => n as FarcasterNetwork);
+  }
+
+  async getDbSchemaVersion(): Promise<number> {
+    const dbResult = await ResultAsync.fromPromise(
+      this.rocksDB.get(Buffer.from([RootPrefix.DBSchemaVersion])),
+      (e) => e as HubError,
+    );
+    if (dbResult.isErr()) {
+      return 0;
+    }
+
+    // parse the buffer as an int
+    const schemaVersion = Result.fromThrowable(
+      () => dbResult.value.readUInt32BE(0),
+      (e) => e as HubError,
+    )();
+
+    return schemaVersion.unwrapOr(0);
+  }
+
+  async setDbSchemaVersion(version: number): HubAsyncResult<void> {
+    const txn = this.rocksDB.transaction();
+    const value = Buffer.alloc(4);
+    value.writeUInt32BE(version, 0);
+    txn.put(Buffer.from([RootPrefix.DBSchemaVersion]), value);
+
+    return ResultAsync.fromPromise(this.rocksDB.commit(txn), (e) => e as HubError);
   }
 
   async setDbNetwork(network: FarcasterNetwork): HubAsyncResult<void> {

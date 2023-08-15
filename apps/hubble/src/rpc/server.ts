@@ -58,6 +58,7 @@ import {
 } from "./bufferedStreamWriter.js";
 import { sleep } from "../utils/crypto.js";
 import { SUBMIT_MESSAGE_RATE_LIMIT, rateLimitByIp } from "../utils/rateLimits.js";
+import { statsd } from "../utils/statsd.js";
 
 const HUBEVENTS_READER_TIMEOUT = 1 * 60 * 60 * 1000; // 1 hour
 
@@ -369,11 +370,13 @@ export default class Server {
             callback(toServiceError(new HubError("bad_request", "Hub isn't initialized")));
             return;
           }
+
           let peersToCheck: string[];
           if (call.request.peerId && call.request.peerId.length > 0) {
             peersToCheck = [call.request.peerId];
           } else {
-            peersToCheck = this.gossipNode.allPeerIds();
+            // If no peerId is specified, check upto 20 peers
+            peersToCheck = this.gossipNode.allPeerIds().slice(0, 20);
           }
 
           const response = SyncStatusResponse.create({
@@ -382,24 +385,27 @@ export default class Server {
             engineStarted: this.syncEngine.isStarted(),
           });
 
-          for (const peerId of peersToCheck) {
-            const statusResult = await this.syncEngine.getSyncStatusForPeer(peerId, this.hub);
-            if (statusResult.isOk()) {
-              const status = statusResult.value;
-              response.isSyncing = status.isSyncing;
-              const peerStatus = SyncStatus.create({
-                peerId,
-                inSync: status.inSync,
-                shouldSync: status.shouldSync,
-                lastBadSync: status.lastBadSync,
-                divergencePrefix: status.divergencePrefix,
-                divergenceSecondsAgo: status.divergenceSecondsAgo,
-                ourMessages: status.ourSnapshot.numMessages,
-                theirMessages: status.theirSnapshot.numMessages,
-              });
-              response.syncStatus.push(peerStatus);
-            }
-          }
+          await Promise.all(
+            peersToCheck.map(async (peerId) => {
+              const statusResult = await this.syncEngine?.getSyncStatusForPeer(peerId, this.hub as HubInterface);
+              if (statusResult?.isOk()) {
+                const status = statusResult.value;
+                response.isSyncing = status.isSyncing;
+                response.syncStatus.push(
+                  SyncStatus.create({
+                    peerId,
+                    inSync: status.inSync,
+                    shouldSync: status.shouldSync,
+                    lastBadSync: status.lastBadSync,
+                    divergencePrefix: status.divergencePrefix,
+                    divergenceSecondsAgo: status.divergenceSecondsAgo,
+                    ourMessages: status.ourSnapshot.numMessages,
+                    theirMessages: status.theirSnapshot.numMessages,
+                  }),
+                );
+              }
+            }),
+          );
 
           callback(null, response);
         })();
@@ -493,6 +499,7 @@ export default class Server {
         // If someone is asking for our sync snapshot, that means we're getting incoming
         // connections
         this.incomingConnections += 1;
+        statsd().increment("rpc.get_sync_snapshot");
 
         const request = call.request;
 

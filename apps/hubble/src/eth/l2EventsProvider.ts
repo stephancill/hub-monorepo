@@ -23,6 +23,7 @@ import { WatchContractEvent } from "./watchContractEvent.js";
 import { WatchBlockNumber } from "./watchBlockNumber.js";
 import { ExtractAbiEvent } from "abitype";
 import { onChainEventSorter } from "../storage/db/onChainEvent.js";
+import { formatPercentage } from "../profile/profile.js";
 
 const log = logger.child({
   component: "L2EventsProvider",
@@ -32,9 +33,9 @@ export class OptimismConstants {
   public static StorageRegistryAddress = "0x000000fC0a4Fccee0b30E360773F7888D1bD9FAA" as const;
   public static KeyRegistryAddress = "0x000000fc6548800fc8265d8eb7061d88cefb87c2" as const;
   public static IdRegistryAddress = "0x000000fc99489b8cd629291d97dbca62b81173c4" as const;
-  public static FirstBlock = 12500000;
+  public static FirstBlock = 108222360; // ~Aug 14 2023 8pm UTC, approx 1.5 weeks before planned migration
   public static ChunkSize = 1000;
-  public static ChainId = 420; // OP Goerli
+  public static ChainId = 10; // OP mainnet
 }
 
 const RENT_EXPIRY_IN_SECONDS = 365 * 24 * 60 * 60; // One year
@@ -495,14 +496,14 @@ export class L2EventsProvider {
       return;
     }
 
-    log.info({ latestBlock: latestBlock }, "connected to ethereum node");
+    log.info({ latestBlock: latestBlock }, "connected to optimism node");
 
     // Find how how much we need to sync
     let lastSyncedBlock = this._firstBlock;
 
     const hubState = await this._hub.getHubState();
-    if (hubState.isOk() && hubState.value.lastEthBlock) {
-      lastSyncedBlock = hubState.value.lastEthBlock;
+    if (hubState.isOk() && hubState.value.lastL2Block) {
+      lastSyncedBlock = hubState.value.lastL2Block;
     }
 
     if (this._resyncEvents) {
@@ -561,7 +562,8 @@ export class L2EventsProvider {
      */
 
     // Calculate amount of runs required based on batchSize, and round up to capture all blocks
-    const numOfRuns = Math.ceil((toBlock - fromBlock) / batchSize);
+    const totalBlocks = toBlock - fromBlock;
+    const numOfRuns = Math.ceil(totalBlocks / batchSize);
 
     for (let i = 0; i < numOfRuns; i++) {
       this._blockTimestampsCache.clear(); // Clear the cache for each block to avoid unbounded growth
@@ -572,7 +574,10 @@ export class L2EventsProvider {
         // If this isn't our first loop, we need to up the fromBlock by 1, or else we will be re-caching an already cached block.
         nextFromBlock += 1;
       }
-      log.info({ fromBlock: nextFromBlock, toBlock: nextToBlock }, "syncing events from block range");
+      log.info(
+        { fromBlock: nextFromBlock, toBlock: nextToBlock },
+        `syncing events (${formatPercentage((nextFromBlock - fromBlock) / totalBlocks)})`,
+      );
 
       const idFilter = await this._publicClient.createContractEventFilter({
         address: OptimismConstants.IdRegistryAddress,
@@ -581,8 +586,7 @@ export class L2EventsProvider {
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const idLogs = await this._publicClient.getFilterLogs({ filter: idFilter });
-      await this.processIdRegistryEvents(idLogs);
+      const idLogsPromise = this._publicClient.getFilterLogs({ filter: idFilter });
 
       const storageFilter = await this._publicClient.createContractEventFilter({
         address: OptimismConstants.StorageRegistryAddress,
@@ -591,10 +595,9 @@ export class L2EventsProvider {
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const storageLogs = await this._publicClient.getFilterLogs({
+      const storageLogsPromise = this._publicClient.getFilterLogs({
         filter: storageFilter,
       });
-      await this.processStorageEvents(storageLogs);
 
       const keyFilter = await this._publicClient.createContractEventFilter({
         address: OptimismConstants.KeyRegistryAddress,
@@ -603,8 +606,11 @@ export class L2EventsProvider {
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const keyLogs = await this._publicClient.getFilterLogs({ filter: keyFilter });
-      await this.processKeyRegistryEvents(keyLogs);
+      const keyLogsPromise = this._publicClient.getFilterLogs({ filter: keyFilter });
+
+      await this.processIdRegistryEvents(await idLogsPromise);
+      await this.processStorageEvents(await storageLogsPromise);
+      await this.processKeyRegistryEvents(await keyLogsPromise);
     }
   }
 
@@ -633,8 +639,13 @@ export class L2EventsProvider {
 
     // Update the last synced block if all the historical events have been synced
     if (this._isHistoricalSyncDone) {
-      const hubState = HubState.create({ lastEthBlock: blockNumber });
-      await this._hub.putHubState(hubState);
+      const hubState = await this._hub.getHubState();
+      if (hubState.isOk()) {
+        hubState.value.lastL2Block = blockNumber;
+        await this._hub.putHubState(hubState.value);
+      } else {
+        log.error({ errCode: hubState.error.errCode }, `failed to get hub state: ${hubState.error.message}`);
+      }
     }
 
     this._blockTimestampsCache.clear(); // Clear the cache periodically to avoid unbounded growth
