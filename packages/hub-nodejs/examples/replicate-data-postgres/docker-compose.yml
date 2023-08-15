@@ -6,6 +6,8 @@ services:
     restart: unless-stopped
     command: ["sh", "-c", "yarn install && exec yarn start"]
     init: true
+    env_file:
+      - .env
     environment:
       - NODE_OPTIONS=--max-old-space-size=512 # Limit memory usage
       - POSTGRES_URL=postgres://app:password@postgres:5432/hub
