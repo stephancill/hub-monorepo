@@ -124,7 +124,7 @@ export class HubReplicator {
     this.subscriber.start(subscription?.lastEventId);
 
     // Start backfilling all historical data in the background
-    this.backfill();
+    // this.backfill();
   }
 
   public stop() {
