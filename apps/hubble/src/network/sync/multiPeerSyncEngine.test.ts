@@ -12,6 +12,7 @@ import {
   TrieNodePrefix,
   HubInfoRequest,
   getFarcasterTime,
+  OnChainEvent,
 } from "@farcaster/hub-nodejs";
 import { APP_NICKNAME, APP_VERSION, HubInterface } from "../../hubble.js";
 import SyncEngine from "./syncEngine.js";
@@ -24,6 +25,7 @@ import { sleep, sleepWhile } from "../../utils/crypto.js";
 import { EthEventsProvider } from "../../eth/ethEventsProvider.js";
 import { deployIdRegistry, deployNameRegistry, publicClient } from "../../test/utils.js";
 import { EMPTY_HASH } from "./trieNode.js";
+import { L2EventsProvider } from "../../eth/l2EventsProvider.js";
 
 const TEST_TIMEOUT_LONG = 60 * 1000;
 
@@ -103,7 +105,7 @@ describe("Multi peer sync engine", () => {
     engine1 = new Engine(testDb1, network);
     hub1 = new MockHub(testDb1, engine1);
     syncEngine1 = new SyncEngine(hub1, testDb1);
-    syncEngine1.initialize();
+    syncEngine1.start();
     server1 = new Server(hub1, engine1, syncEngine1);
     port1 = await server1.start();
     clientForServer1 = getInsecureHubRpcClient(`127.0.0.1:${port1}`);
@@ -142,7 +144,7 @@ describe("Multi peer sync engine", () => {
     // are loaded into the sync engine Merkle Trie properly.
     await syncEngine1.trie.commitToDb();
     const reinitSyncEngine = new SyncEngine(hub1, testDb1);
-    await reinitSyncEngine.initialize();
+    await reinitSyncEngine.start();
 
     expect(await reinitSyncEngine.trie.rootHash()).toEqual(await syncEngine1.trie.rootHash());
 
@@ -398,6 +400,65 @@ describe("Multi peer sync engine", () => {
     expect(retrySpy).toHaveBeenCalled();
   });
 
+  describe("after migration", () => {
+    let engine2: Engine;
+    let syncEngine2: SyncEngine;
+    let retryEventsMock: L2EventsProvider;
+    let custodyEvent: OnChainEvent;
+    let signerEvent: OnChainEvent;
+
+    beforeEach(async () => {
+      engine2 = new Engine(testDb2, network);
+      const hub2 = new MockHub(testDb2, engine2);
+      // rome-ignore lint/suspicious/noExplicitAny: mock used only in tests
+      const l2EventsProvider = jest.fn() as any;
+      l2EventsProvider.retryEventsFromBlock = jest.fn();
+      retryEventsMock = l2EventsProvider.retryEventsFromBlock;
+
+      syncEngine2 = new SyncEngine(hub2, testDb2, undefined, l2EventsProvider);
+
+      // Set up engine1
+      custodyEvent = Factories.IdRegistryOnChainEvent.build({ fid });
+      signerEvent = Factories.SignerOnChainEvent.build({
+        fid,
+        signerEventBody: Factories.SignerEventBody.build({ key: (await signer.getSignerKey())._unsafeUnwrap() }),
+      });
+      const migratedEvent = Factories.SignerMigratedOnChainEvent.build();
+      await engine1.mergeOnChainEvent(custodyEvent);
+      await engine1.mergeOnChainEvent(signerEvent);
+      await engine1.mergeOnChainEvent(migratedEvent);
+
+      await engine2.mergeOnChainEvent(migratedEvent);
+      await addMessagesWithTimeDelta(engine1, [167]);
+    });
+    test("retries the id registry event block if it's missing", async () => {
+      await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+      // Because do it without awaiting, we need to wait for the promise to resolve
+      await sleep(100);
+      expect(retryEventsMock).toHaveBeenCalledWith(custodyEvent.blockNumber);
+    });
+
+    test("retries the signer event block if it's missing", async () => {
+      await engine2.mergeOnChainEvent(custodyEvent);
+      await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+      // Because do it without awaiting, we need to wait for the promise to resolve
+      await sleep(100);
+      expect(retryEventsMock).toHaveBeenCalledWith(signerEvent.blockNumber);
+    });
+
+    test("does not retry any block if both events are present", async () => {
+      await engine2.mergeOnChainEvent(custodyEvent);
+      await engine2.mergeOnChainEvent(signerEvent);
+      await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+      // Because do it without awaiting, we need to wait for the promise to resolve
+      await sleep(100);
+      expect(retryEventsMock).not.toHaveBeenCalled();
+    });
+  });
+
   test("Merge with multiple signers", async () => {
     await engine1.mergeIdRegistryEvent(custodyEvent);
 
@@ -436,7 +497,7 @@ describe("Multi peer sync engine", () => {
     await engine2.mergeIdRegistryEvent(custodyEvent);
 
     const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
+    await syncEngine2.start();
 
     // Try to merge all the messages, to see if it fetches the right signers
     const results = await syncEngine2.mergeMessages(castAdds, clientForServer1);
@@ -462,7 +523,7 @@ describe("Multi peer sync engine", () => {
     const engine2 = new Engine(testDb2, network);
     const hub2 = new MockHub(testDb2, engine2);
     const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
+    await syncEngine2.start();
 
     // Add a message to engine1 synctrie, but not to the engine itself.
     syncEngine1.trie.insert(new SyncId(signerAdd));
@@ -487,7 +548,7 @@ describe("Multi peer sync engine", () => {
     const engine2 = new Engine(testDb2, network);
     const hub2 = new MockHub(testDb2, engine2);
     const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
+    await syncEngine2.start();
 
     // We add it to the engine2 synctrie as normal...
     await engine2.mergeIdRegistryEvent(custodyEvent);
@@ -671,7 +732,7 @@ describe("Multi peer sync engine", () => {
       const engine2 = new Engine(testDb2, network);
       const hub2 = new MockHub(testDb2, engine2);
       const syncEngine2 = new SyncEngine(hub2, testDb2);
-      syncEngine2.initialize();
+      syncEngine2.start();
 
       // Engine 2 should sync with engine1
       expect(
@@ -704,7 +765,7 @@ describe("Multi peer sync engine", () => {
       expect(await reinitSyncEngine.trie.rootHash()).toEqual("");
 
       totalTime = await timedTest(async () => {
-        await reinitSyncEngine.initialize();
+        await reinitSyncEngine.start();
       });
       // console.log('MerkleTrie total time', totalTime, 'seconds. Messages per second:', totalMessages / totalTime);
 

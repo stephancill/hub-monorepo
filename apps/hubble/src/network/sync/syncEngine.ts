@@ -1,29 +1,31 @@
 import {
+  bytesToHexString,
+  ContactInfoContent,
+  FidRequest,
   getFarcasterTime,
   HubAsyncResult,
   HubError,
   HubResult,
   HubRpcClient,
-  Metadata,
-  ContactInfoContent,
   MergeMessageHubEvent,
+  MergeUsernameProofHubEvent,
+  Message,
+  Metadata,
+  OnChainEventRequest,
+  OnChainEventType,
   PruneMessageHubEvent,
   RevokeMessageHubEvent,
-  TrieNodePrefix,
   SyncIds,
-  Message,
-  FidRequest,
   TrieNodeMetadataResponse,
-  bytesToHexString,
-  MergeUsernameProofHubEvent,
+  TrieNodePrefix,
 } from "@farcaster/hub-nodejs";
 import { PeerId } from "@libp2p/interface-peer-id";
 import { err, ok, Result, ResultAsync } from "neverthrow";
 import { TypedEmitter } from "tiny-typed-emitter";
 import { EthEventsProvider } from "../../eth/ethEventsProvider.js";
-import { Hub, HubInterface } from "../../hubble.js";
-import { MerkleTrie, NodeMetadata } from "../../network/sync/merkleTrie.js";
-import { prefixToTimestamp, SyncId, timestampToPaddedTimestampPrefix } from "../../network/sync/syncId.js";
+import { APP_VERSION, FARCASTER_VERSION, Hub, HubInterface } from "../../hubble.js";
+import { MerkleTrie, NodeMetadata } from "./merkleTrie.js";
+import { prefixToTimestamp, SyncId, timestampToPaddedTimestampPrefix } from "./syncId.js";
 import { TrieSnapshot } from "./trieNode.js";
 import { getManyMessages } from "../../storage/db/message.js";
 import RocksDB from "../../storage/db/rocksdb.js";
@@ -35,6 +37,8 @@ import { bytesStartsWith, fromFarcasterTime } from "@farcaster/core";
 import { L2EventsProvider } from "../../eth/l2EventsProvider.js";
 import { SyncEngineProfiler } from "./syncEngineProfiler.js";
 import os from "os";
+import { addProgressBar, finishAllProgressBars } from "../../utils/progressBars.js";
+import { SingleBar } from "cli-progress";
 
 // Number of seconds to wait for the network to "settle" before syncing. We will only
 // attempt to sync messages that are older than this time.
@@ -111,6 +115,7 @@ class CurrentSyncStatus {
   startTimestamp?: number;
   fidRetryMessageQ = new Map<number, Message[]>();
   seriousValidationFailures = 0;
+  initialSync = false;
 
   constructor(peerId?: string) {
     if (peerId) {
@@ -150,6 +155,9 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
   // Number of messages since last compaction
   private _messagesSinceLastCompaction = 0;
   private _isCompacting = false;
+
+  // The latest sync snapshot for each peer
+  private _peerSyncSnapshot = new Map<string, TrieSnapshot>();
 
   // Has the syncengine started yet?
   private _started = false;
@@ -232,11 +240,17 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     return this._syncMergeQ;
   }
 
+  public avgPeerNumMessages(): number {
+    const filtered = Array.from(this._peerSyncSnapshot.values()).filter((snapshot) => snapshot.numMessages > 0);
+    const total = filtered.reduce((acc, snapshot) => acc + snapshot.numMessages, 0);
+    return filtered.length ? total / filtered.length : 0;
+  }
+
   public isStarted(): boolean {
     return this._started;
   }
 
-  public async initialize(rebuildSyncTrie = false) {
+  public async start(rebuildSyncTrie = false) {
     // Check if we need to rebuild sync trie
     if (rebuildSyncTrie) {
       await this.rebuildSyncTrie();
@@ -317,9 +331,17 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
   public async diffSyncIfRequired(hub: Hub, peerIdString?: string) {
     this.emit("syncStart");
 
+    // Log the version number for the dashboard
+    statsd().gauge(`farcaster.version.${FARCASTER_VERSION}`, 1);
+    statsd().gauge(`farcaster.hubversion.${APP_VERSION}`, 1);
+
     if (this.currentHubPeerContacts.size === 0) {
       log.warn("Diffsync: No peer contacts, skipping sync");
       this.emit("syncComplete", false);
+
+      if (!this._currentSyncStatus.isSyncing) {
+        finishAllProgressBars(true);
+      }
       return;
     }
 
@@ -348,6 +370,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     if (!peerContact || !peerId) {
       log.warn({ peerContact, peerId }, "Diffsync: No contact info for peer, skipping sync");
       this.emit("syncComplete", false);
+
+      if (!this._currentSyncStatus.isSyncing) {
+        finishAllProgressBars(true);
+      }
       return;
     }
 
@@ -359,6 +385,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       // the periodic ContactInfo gossip job.
       this.removeContactInfoForPeerId(updatedPeerIdString);
       this.emit("syncComplete", false);
+
+      if (!this._currentSyncStatus.isSyncing) {
+        finishAllProgressBars(true);
+      }
       return;
     }
 
@@ -380,6 +410,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
           "Diffsync: Failed to get peer state, skipping sync",
         );
         this.emit("syncComplete", false);
+
+        if (!this._currentSyncStatus.isSyncing) {
+          finishAllProgressBars(true);
+        }
         return;
       }
 
@@ -388,6 +422,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       if (syncStatusResult.isErr()) {
         log.warn("Diffsync: Failed to get shouldSync");
         this.emit("syncComplete", false);
+
+        if (!this._currentSyncStatus.isSyncing) {
+          finishAllProgressBars(true);
+        }
         return;
       }
 
@@ -409,6 +447,9 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
         },
         "DiffSync: SyncStatus", // Search for this string in the logs to get summary of sync status
       );
+
+      // Save the peer's sync snapshot
+      this._peerSyncSnapshot.set(updatedPeerIdString, syncStatus.theirSnapshot);
 
       if (syncStatus.shouldSync === true) {
         log.info({ peerId }, "Diffsync: Starting Sync with peer");
@@ -513,6 +554,23 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       } else {
         const ourSnapshot = snapshot.value;
 
+        let progressBar: SingleBar | undefined;
+
+        const missingMessages = otherSnapshot.numMessages - ourSnapshot.numMessages;
+        if (missingMessages > 10_000) {
+          this._currentSyncStatus.initialSync = true;
+          progressBar = addProgressBar("Initial Sync", missingMessages);
+
+          if (ourSnapshot.numMessages === 0) {
+            // If we have no messages, we need to fetch all messages from the peer
+            // so start with the signers
+            await this.getAllSignersFromPeer(rpcClient, progressBar);
+          }
+        } else {
+          this._currentSyncStatus.initialSync = false;
+          finishAllProgressBars(true);
+        }
+
         const divergencePrefix = this.getDivergencePrefix(ourSnapshot, otherSnapshot.excludedHashes);
         log.info(
           {
@@ -527,6 +585,13 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
         await this.fetchMissingHashesByPrefix(divergencePrefix, rpcClient, async (missingIds: Uint8Array[]) => {
           const result = await this.fetchAndMergeMessages(missingIds, rpcClient);
           fullSyncResult.addResult(result);
+          progressBar?.increment(result.total);
+
+          const avgPeerNumMessages = this.avgPeerNumMessages();
+          statsd().gauge(
+            "syncengine.sync_percent",
+            avgPeerNumMessages > 0 ? Math.min(1, (await this.trie.items()) / avgPeerNumMessages) : 0,
+          );
         });
 
         log.info({ syncResult: fullSyncResult }, "Perform sync: Sync Complete");
@@ -549,9 +614,78 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       log.warn(e, "Perform sync: Error");
     } finally {
       this._currentSyncStatus.isSyncing = false;
+      if (this._currentSyncStatus.initialSync) {
+        finishAllProgressBars(true);
+      }
     }
 
     return fullSyncResult;
+  }
+
+  async getAllSignersFromPeer(rpcClient: HubRpcClient, progressBar?: SingleBar): Promise<boolean> {
+    // Get all signers from the peer to speed up the sync
+
+    // First, fetch all FIDs from the peer
+    let finished = false;
+    let pageToken: Uint8Array | undefined;
+    const fids: number[] = [];
+
+    do {
+      const fidRequest = FidRequest.create({ pageToken, pageSize: 1000 });
+      const fidResult = await rpcClient.getFids(fidRequest, new Metadata(), rpcDeadline());
+
+      if (fidResult.isErr()) {
+        log.error({ err: fidResult.error }, "Failed to fetch FIDs from peer");
+        return false;
+      }
+
+      const { fids: fetchedFids, nextPageToken } = fidResult.value;
+      fids.push(...fetchedFids);
+      if (!nextPageToken) {
+        finished = true;
+      } else {
+        pageToken = nextPageToken;
+      }
+    } while (!finished);
+
+    progressBar?.setTotal(progressBar.getTotal() + fids.length);
+
+    // Then, fetch all signers for the FIDs, in groups of 10
+    for (let i = 0; i < fids.length; i += 10) {
+      const fidsBatch = Array.from({ length: Math.min(10, fids.length - i) }, (_, j) => fids[i + j]);
+      await Promise.all(
+        fidsBatch.map(async (fid) => {
+          if (!fid || this._currentSyncStatus.interruptSync) {
+            return;
+          }
+
+          progressBar?.increment();
+
+          const signerResult = await rpcClient.getSignersByFid(
+            FidRequest.create({ fid }),
+            new Metadata(),
+            rpcDeadline(),
+          );
+          if (signerResult.isErr()) {
+            log.error({ err: signerResult.error }, "Failed to fetch signer from peer");
+
+            // Ignore this FID, we'll just sync the message without the signer
+            return;
+          }
+
+          const { messages } = signerResult.value;
+          for (const signer of messages) {
+            const signerResult = await this._hub.submitMessage(signer, "sync");
+            if (signerResult.isErr()) {
+              log.error({ err: signerResult.error, fid }, "Failed to submit signer");
+              break;
+            }
+          }
+        }),
+      );
+    }
+
+    return true;
   }
 
   async getAllMessagesBySyncIds(syncIds: Uint8Array[]): HubAsyncResult<Message[]> {
@@ -641,7 +775,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
         if (result.error.errCode === "bad_request.validation_failure") {
           if (result.error.message.startsWith("invalid signer")) {
             // The user's signer was not found. So fetch all signers from the peer and retry.
-            const retryResult = await this.syncUserAndRetryMessage(msg, rpcClient);
+            const retryResult = await this.syncSignersAndRetryMessage(msg, rpcClient);
             const retryResultErrorMessage = retryResult.isErr() ? retryResult.error.message : "";
             log.warn(
               {
@@ -961,22 +1095,35 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       return;
     }
 
-    const custodyEventResult = await rpcClient.getIdRegistryEvent(
-      FidRequest.create({ fid }),
-      new Metadata(),
-      rpcDeadline(),
-    );
-    if (custodyEventResult.isErr()) {
-      log.warn({ fid }, "Failed to fetch custody event from peer");
-      return;
+    if (this._hub.engine.isMigrated) {
+      const l2CustodyEventResult = await rpcClient.getOnChainEvents(
+        OnChainEventRequest.create({ fid, eventType: OnChainEventType.EVENT_TYPE_ID_REGISTER }),
+        new Metadata(),
+        rpcDeadline(),
+      );
+      if (l2CustodyEventResult.isOk() && l2CustodyEventResult.value.events[0]) {
+        const custodyEventBlockNumber = l2CustodyEventResult.value.events[0].blockNumber;
+        log.info({ fid }, `Retrying events from l2 block ${custodyEventBlockNumber}`);
+        await this._l2EventsProvider?.retryEventsFromBlock(custodyEventBlockNumber);
+      } else {
+        log.warn({ fid }, "Failed to fetch custody event from peer");
+        return;
+      }
+    } else {
+      const custodyEventResult = await rpcClient.getIdRegistryEvent(
+        FidRequest.create({ fid }),
+        new Metadata(),
+        rpcDeadline(),
+      );
+      if (custodyEventResult.isErr()) {
+        log.warn({ fid }, "Failed to fetch custody event from peer");
+        return;
+      }
+      const custodyEventBlockNumber = custodyEventResult.value.blockNumber;
+      log.info({ fid }, `Retrying events from block ${custodyEventBlockNumber}`);
+      // We'll retry all events from this block number
+      await this._ethEventsProvider?.retryEventsFromBlock(custodyEventBlockNumber);
     }
-
-    // Get the ethereum block number from the custody event
-    const custodyEventBlockNumber = custodyEventResult.value.blockNumber;
-
-    log.info({ fid }, `Retrying events from block ${custodyEventBlockNumber}`);
-    // We'll retry all events from this block number
-    await this._ethEventsProvider?.retryEventsFromBlock(custodyEventBlockNumber);
   }
 
   /**
@@ -998,7 +1145,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     return true;
   }
 
-  private async syncUserAndRetryMessage(message: Message, rpcClient: HubRpcClient): Promise<HubResult<number>> {
+  private async syncSignersAndRetryMessage(message: Message, rpcClient: HubRpcClient): Promise<HubResult<number>> {
     const fidRetryMessageQ = this._currentSyncStatus.fidRetryMessageQ;
 
     const fid = message.data?.fid;
@@ -1023,35 +1170,42 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     // Probably not required to fetch the signer messages, but doing it here means
     // sync will complete in one round (prevents messages failing to merge due to missed or out of
     // order signer message)
-    const signerMessagesResult = await rpcClient.getAllSignerMessagesByFid(
-      FidRequest.create({ fid }),
-      new Metadata(),
-      rpcDeadline(),
-    );
-    if (signerMessagesResult.isErr()) {
-      return err(new HubError("unavailable.network_failure", "Failed to fetch signer messages"));
+    if (this._hub.engine.isMigrated) {
+      const signerEvents = await rpcClient.getOnChainSignersByFid(
+        FidRequest.create({ fid }),
+        new Metadata(),
+        rpcDeadline(),
+      );
+      if (signerEvents.isErr()) {
+        return err(new HubError("unavailable.network_failure", "Failed to fetch signer events"));
+      }
+      const retryPromises = signerEvents.value.events.map((event) =>
+        this._l2EventsProvider?.retryEventsFromBlock(event.blockNumber),
+      );
+      await Promise.all(retryPromises);
+    } else {
+      const signerMessagesResult = await rpcClient.getAllSignerMessagesByFid(
+        FidRequest.create({ fid }),
+        new Metadata(),
+        rpcDeadline(),
+      );
+      if (signerMessagesResult.isErr()) {
+        return err(new HubError("unavailable.network_failure", "Failed to fetch signer messages"));
+      }
+
+      await Promise.all(signerMessagesResult.value.messages.map((message) => this._hub.submitMessage(message, "sync")));
     }
-
-    const results = await Promise.all(
-      signerMessagesResult.value.messages.map((message) => this._hub.submitMessage(message, "sync")),
-    );
-
     const messages = fidRetryMessageQ.get(fid) ?? [];
     fidRetryMessageQ.set(fid, []);
 
-    if (results.every((r) => r.isErr())) {
-      return err(new HubError("unavailable.storage_failure", "Failed to merge any signer message"));
-    } else {
-      // if at least one signer message was merged, retry the messages in the queue
-      const results = await Promise.all(messages.map(async (message) => this._hub.submitMessage(message, "sync")));
+    const results = await Promise.all(messages.map(async (message) => this._hub.submitMessage(message, "sync")));
 
-      // If any of the messages failed, return a hub error
-      const firstFailed = results.find((r) => r.isErr());
-      if (firstFailed) {
-        return firstFailed;
-      } else {
-        return ok(0);
-      }
+    // If any of the messages failed, return a hub error
+    const firstFailed = results.find((r) => r.isErr());
+    if (firstFailed) {
+      return firstFailed;
+    } else {
+      return ok(0);
     }
   }
 }

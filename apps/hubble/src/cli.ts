@@ -15,7 +15,7 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import { Result, ResultAsync } from "neverthrow";
 import { dirname, resolve } from "path";
 import { exit } from "process";
-import { APP_VERSION, Hub, HubOptions } from "./hubble.js";
+import { APP_VERSION, FARCASTER_VERSION, Hub, HubOptions } from "./hubble.js";
 import { logger } from "./utils/logger.js";
 import { addressInfoFromParts, hostPortFromString, ipMultiAddrStrFromAddressInfo, parseAddress } from "./utils/p2p.js";
 import { DEFAULT_RPC_CONSOLE, startConsole } from "./console/console.js";
@@ -28,6 +28,10 @@ import { profileRPCServer } from "./profile/rpcProfile.js";
 import { profileGossipServer } from "./profile/gossipProfile.js";
 import { initializeStatsd } from "./utils/statsd.js";
 import OnChainEventStore from "./storage/stores/onChainEventStore.js";
+import { startupCheck, StartupCheckStatus } from "./utils/startupCheck.js";
+import { goerli, mainnet, optimism } from "viem/chains";
+import { finishAllProgressBars } from "./utils/progressBars.js";
+import { MAINNET_BOOTSTRAP_PEERS } from "./bootstrapPeers.mainnet.js";
 
 /** A CLI to accept options from the user and start the Hub */
 
@@ -81,7 +85,7 @@ app
   .option("--first-block <number>", "The block number to begin syncing events from Farcaster contracts", parseNumber)
 
   // L2 Options
-  .option("-l, --l2-rpc-url <url>", "RPC URL of a Goerli Optimism Node (or comma separated list of URLs)")
+  .option("-l, --l2-rpc-url <url>", "RPC URL of a mainnet Optimism Node (or comma separated list of URLs)")
   .option("--l2-id-registry-address <address>", "The address of the L2 Farcaster ID Registry contract")
   .option("--l2-key-registry-address <address>", "The address of the L2 Farcaster Key Registry contract")
   .option("--l2-storage-registry-address <address>", "The address of the L2 Farcaster Storage Registry contract")
@@ -129,6 +133,10 @@ app
   .option("--gossip-metrics-enabled", "Generate tracing and metrics for the gossip network. (default: disabled)")
 
   // Debugging options
+  .option(
+    "--disable-console-status",
+    "Immediately log to STDOUT, and disable console status and progressbars. (default: disabled)",
+  )
   .option("--profile-sync", "Profile a full hub sync and exit. (default: disabled)")
   .option("--rebuild-sync-trie", "Rebuild the sync trie before starting (default: disabled)")
   .option("--resync-eth-events", "Resync events from the Farcaster contracts before starting (default: disabled)")
@@ -147,6 +155,8 @@ app
 
   .action(async (cliOptions) => {
     const handleShutdownSignal = (signalName: string) => {
+      logger.flush();
+
       logger.warn(`${signalName} received`);
       if (!isExiting) {
         isExiting = true;
@@ -168,10 +178,23 @@ app
       }
     };
 
+    // Start the logger off in buffered mode
+    logger.$.startBuffering();
+
+    console.log("\n Hubble Startup Checks");
+    console.log("------------------------");
+
+    startupCheck.printStartupCheckStatus(
+      StartupCheckStatus.OK,
+      `Farcaster: ${FARCASTER_VERSION} Hubble: ${APP_VERSION}`,
+    );
+
     // We'll write our process number to a file so that we can detect if another hub process has taken over.
     const processFileDir = `${DB_DIRECTORY}/process/`;
     const processFilePrefix = cliOptions.processFilePrefix?.concat("_") ?? "";
     const processFileName = `${processFilePrefix}process_number.txt`;
+
+    startupCheck.directoryWritable(DB_DIRECTORY);
 
     // Generate a random number to identify this hub instance
     // Note that we can't use the PID as the identifier, since the hub running in a docker container will
@@ -215,14 +238,27 @@ app
     let hubConfig: any = DefaultConfig;
     if (cliOptions.config) {
       if (!cliOptions.config.endsWith(".js")) {
+        startupCheck.printStartupCheckStatus(StartupCheckStatus.ERROR, "Config file must be a .js file");
         throw new Error(`Config file ${cliOptions.config} must be a .js file`);
       }
 
       if (!fs.existsSync(resolve(cliOptions.config))) {
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Config file ${cliOptions.config} does not exist`,
+        );
         throw new Error(`Config file ${cliOptions.config} does not exist`);
       }
 
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Loading config file ${cliOptions.config}`);
       hubConfig = (await import(resolve(cliOptions.config))).Config;
+    }
+
+    const disableConsoleStatus = cliOptions.disableConsoleStatus ?? hubConfig.disableConsoleStatus ?? false;
+    if (disableConsoleStatus) {
+      logger.info("Interactive Progress Bars disabled");
+      logger.flush();
+      finishAllProgressBars();
     }
 
     // Read PeerID from 1. CLI option, 2. Environment variable, 3. Config file
@@ -230,9 +266,12 @@ app
     if (cliOptions.id) {
       const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(cliOptions.id)), (e) => e);
       if (peerIdR.isErr()) {
-        throw new Error(
-          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`,
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Failed to read identity from ${cliOptions.id}. Please run "yarn identity create".`,
+          "https://www.thehubble.xyz/intro/install.html#installing-hubble\n",
         );
+        process.exit(1);
       } else {
         peerId = peerIdR.value;
       }
@@ -240,7 +279,7 @@ app
       // Read from the environment variable
       const identityProtoBytes = Buffer.from(process.env["IDENTITY_B64"], "base64");
       const peerIdResult = await ResultAsync.fromPromise(createFromProtobuf(identityProtoBytes), (e) => {
-        return new Error(`Failed to read identity from environment: ${e}`);
+        throw new Error("Failed to read identity from environment");
       });
 
       if (peerIdResult.isErr()) {
@@ -250,15 +289,24 @@ app
       peerId = peerIdResult.value;
       logger.info({ identity: peerId.toString() }, "Read identity from environment");
     } else {
-      const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(hubConfig.id)), (e) => e);
+      const idFile = resolve(hubConfig.id ?? DEFAULT_PEER_ID_LOCATION);
+      startupCheck.directoryWritable(dirname(idFile));
+
+      const peerIdR = await ResultAsync.fromPromise(readPeerId(idFile), (e) => e);
       if (peerIdR.isErr()) {
-        throw new Error(
-          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`,
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Failed to read identity from ${idFile}. Please run "yarn identity create".`,
+          "https://www.thehubble.xyz/intro/install.html#installing-hubble\n",
         );
+
+        process.exit(1);
       } else {
         peerId = peerIdR.value;
       }
     }
+
+    startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Found PeerId ${peerId.toString()}`);
 
     // Read RPC Auth from 1. CLI option, 2. Environment variable, 3. Config file
     let rpcAuth;
@@ -312,12 +360,22 @@ app
       } else {
         logger.info({ server: server.value }, "Statsd server specified. Statsd enabled");
         initializeStatsd(server.value.address, server.value.port);
+        startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, "Hubble Monitoring enabled");
       }
     } else {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.WARNING,
+        "Hubble Monitoring is disabled",
+        "https://www.thehubble.xyz/intro/install.html#monitoring-hubble",
+      );
       logger.info({}, "No statsd server specified. Statsd disabled");
     }
 
     const network = cliOptions.network ?? hubConfig.network;
+    startupCheck.printStartupCheckStatus(
+      StartupCheckStatus.OK,
+      `Network is ${FarcasterNetwork[network]?.toString()}(${network})`,
+    );
 
     let testUsers;
     if (process.env["TEST_USERS"]) {
@@ -351,7 +409,11 @@ app
       throw ipMultiAddrResult.error;
     }
 
-    const bootstrapAddrs = ((cliOptions.bootstrap ?? hubConfig.bootstrap ?? []) as string[])
+    const bootstrapAddrs = (
+      (cliOptions.bootstrap ??
+        hubConfig.bootstrap ??
+        (network === FarcasterNetwork.MAINNET ? MAINNET_BOOTSTRAP_PEERS : [])) as string[]
+    )
       .map((a) => parseAddress(a))
       .map((a) => {
         if (a.isErr()) {
@@ -364,6 +426,15 @@ app
       })
       .filter((a) => a.isOk())
       .map((a) => a._unsafeUnwrap());
+    if (bootstrapAddrs.length > 0) {
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Bootstrapping from ${bootstrapAddrs.length} peers`);
+    } else {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.WARNING,
+        "No bootstrap peers specified. Hubble will not be able to sync without them.",
+        "https://www.thehubble.xyz/intro/networks.html",
+      );
+    }
 
     const directPeers = ((cliOptions.directPeers ?? hubConfig.directPeers ?? []) as string[])
       .map((a) => parseAddress(a))
@@ -440,15 +511,39 @@ app
       directPeers,
     };
 
+    await startupCheck.rpcCheck(options.ethRpcUrl, goerli, "L1");
+    await startupCheck.rpcCheck(options.ethMainnetRpcUrl, mainnet, "L1");
+    await startupCheck.rpcCheck(options.l2RpcUrl, optimism, "L2", options.l2ChainId);
+
+    if (startupCheck.anyFailedChecks()) {
+      logger.fatal({ reason: "Startup checks failed" }, "shutting down hub");
+      logger.flush();
+      process.exit(1);
+    }
+
     const hubResult = Result.fromThrowable(
       () => new Hub(options),
       (e) => new Error(`Failed to create hub: ${e}`),
     )();
     if (hubResult.isErr()) {
-      logger.fatal(hubResult.error);
-      logger.fatal({ reason: "Hub Creation failed" }, "shutting down hub");
+      if (!startupCheck.anyFailedChecks()) {
+        logger.fatal(hubResult.error);
+        logger.fatal({ reason: "Hub Creation failed" }, "shutting down hub");
 
+        logger.flush();
+      }
       process.exit(1);
+    }
+
+    if (statsDServer && !disableConsoleStatus) {
+      console.log("\nMonitor Your Node");
+      console.log("----------------");
+      console.log("🔗 | Grafana at http://localhost:3000");
+    }
+
+    if (!disableConsoleStatus) {
+      console.log("\n Starting Hubble");
+      console.log("------------------");
     }
 
     const hub = hubResult.value;
@@ -462,6 +557,7 @@ app
       try {
         await hub.teardown();
       } finally {
+        logger.flush();
         process.exit(1);
       }
     }
@@ -633,7 +729,7 @@ app
         break;
       }
 
-      await sleep(10_000);
+      await sleep(60 * 1000);
     }
     exit(0);
   });

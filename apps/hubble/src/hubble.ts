@@ -19,6 +19,7 @@ import {
   NetworkLatencyMessage,
   OnChainEvent,
   onChainEventTypeToJSON,
+  ClientOptions,
 } from "@farcaster/hub-nodejs";
 import { PeerId } from "@libp2p/interface-peer-id";
 import { peerIdFromBytes } from "@libp2p/peer-id";
@@ -75,18 +76,20 @@ import { NetworkConfig, applyNetworkConfig, fetchNetworkConfig } from "./network
 import { UpdateNetworkConfigJobScheduler } from "./storage/jobs/updateNetworkConfigJob.js";
 import { statsd } from "./utils/statsd.js";
 import { LATEST_DB_SCHEMA_VERSION, performDbMigrations } from "./storage/db/migrations/migrations.js";
+import { addProgressBar, finishAllProgressBars } from "./utils/progressBars.js";
 
 export type HubSubmitSource = "gossip" | "rpc" | "eth-provider" | "l2-provider" | "sync" | "fname-registry";
 
 export const APP_VERSION = packageJson.version;
 export const APP_NICKNAME = process.env["HUBBLE_NAME"] ?? "Farcaster Hub";
 
-export const FARCASTER_VERSION = "2023.7.12";
+export const FARCASTER_VERSION = "2023.8.23";
 export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: "2023.3.1", expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
   { version: "2023.4.19", expiresAt: 1686700800000 }, // expires at 6/14/23 00:00 UTC
   { version: "2023.5.31", expiresAt: 1690329600000 }, // expires at 7/26/23 00:00 UTC
   { version: "2023.7.12", expiresAt: 1693958400000 }, // expires at 9/6/23 00:00 UTC
+  { version: "2023.8.23", expiresAt: 1697587200000 }, // expires at 10/18/23 00:00 UTC
 ];
 
 export interface HubInterface {
@@ -99,7 +102,11 @@ export interface HubInterface {
   getHubState(): HubAsyncResult<HubState>;
   putHubState(hubState: HubState): HubAsyncResult<void>;
   gossipContactInfo(): HubAsyncResult<void>;
-  getRPCClientForPeer(peerId: PeerId, peer: ContactInfoContent): Promise<HubRpcClient | undefined>;
+  getRPCClientForPeer(
+    peerId: PeerId,
+    peer: ContactInfoContent,
+    options?: Partial<ClientOptions>,
+  ): Promise<HubRpcClient | undefined>;
 }
 
 export interface HubOptions {
@@ -326,7 +333,8 @@ export class Hub implements HubInterface {
         options.l2RentExpiryOverride,
       );
     } else {
-      log.warn("No L2 RPC URL provided, not syncing with L2 contract events");
+      log.warn("No L2 RPC URL provided, unable to sync L2 contract events");
+      throw new HubError("bad_request.invalid_param", "Invalid l2 rpc url");
     }
 
     if (options.fnameServerUrl && options.fnameServerUrl !== "") {
@@ -351,7 +359,6 @@ export class Hub implements HubInterface {
       chain: mainnet,
       transport: fallback(transports, { rank: options.rankRpcs ?? false }),
     });
-
     this.engine = new Engine(this.rocksDB, options.network, eventHandler, mainnetClient);
 
     const profileSync = options.profileSync ?? false;
@@ -495,6 +502,21 @@ export class Hub implements HubInterface {
       }
     }
 
+    // Get the Network ID from the DB
+    const dbNetworkResult = await this.getDbNetwork();
+    if (dbNetworkResult.isOk() && dbNetworkResult.value && dbNetworkResult.value !== this.options.network) {
+      throw new HubError(
+        "unavailable",
+        `network mismatch: DB is ${dbNetworkResult.value}, but Hub is started with ${this.options.network}. Please reset the DB with the 'yarn dbreset' if this is intentional.`,
+      );
+    }
+
+    // Set the network in the DB
+    await this.setDbNetwork(this.options.network);
+    log.info(
+      `starting hub with Farcaster version ${FARCASTER_VERSION}, app version ${APP_VERSION} and network ${this.options.network}`,
+    );
+
     // Get the DB Schema version
     const dbSchemaVersion = await this.getDbSchemaVersion();
     if (dbSchemaVersion > LATEST_DB_SCHEMA_VERSION) {
@@ -517,21 +539,6 @@ export class Hub implements HubInterface {
       log.info({ dbSchemaVersion, latestDbSchemaVersion: LATEST_DB_SCHEMA_VERSION }, "DB schema is up-to-date");
     }
 
-    // Get the Network ID from the DB
-    const dbNetworkResult = await this.getDbNetwork();
-    if (dbNetworkResult.isOk() && dbNetworkResult.value && dbNetworkResult.value !== this.options.network) {
-      throw new HubError(
-        "unavailable",
-        `network mismatch: DB is ${dbNetworkResult.value}, but Hub is started with ${this.options.network}. Please reset the DB with the "dbreset" command if this is intentional.`,
-      );
-    }
-
-    // Set the network in the DB
-    await this.setDbNetwork(this.options.network);
-    log.info(
-      `starting hub with Farcaster version ${FARCASTER_VERSION}, app version ${APP_VERSION} and network ${this.options.network}`,
-    );
-
     // Fetch network config
     if (this.options.network === FarcasterNetwork.MAINNET) {
       const networkConfig = await fetchNetworkConfig();
@@ -542,8 +549,6 @@ export class Hub implements HubInterface {
         if (shouldExit) {
           throw new HubError("unavailable", "Quitting due to network config");
         }
-
-        log.info({ networkConfig }, "Network config applied");
       }
     }
     await this.engine.start();
@@ -567,24 +572,9 @@ export class Hub implements HubInterface {
     await this.fNameRegistryEventsProvider?.start();
 
     // Start the sync engine
-    await this.syncEngine.initialize(this.options.rebuildSyncTrie ?? false);
+    await this.syncEngine.start(this.options.rebuildSyncTrie ?? false);
 
-    let bootstrapAddrs = this.options.bootstrapAddrs ?? [];
-    // Add mainnet bootstrap addresses if none are provided
-    if (bootstrapAddrs.length === 0 && this.options.network === FarcasterNetwork.MAINNET) {
-      bootstrapAddrs = MAINNET_BOOTSTRAP_PEERS.map((a) => parseAddress(a))
-        .map((r) => {
-          if (r.isErr()) {
-            logger.warn(
-              { errorCode: r.error.errCode, message: r.error.message },
-              "Couldn't parse bootstrap address from MAINNET_BOOTSTRAP_PEERS, ignoring",
-            );
-          }
-          return r;
-        })
-        .filter((a) => a.isOk())
-        .map((a) => a._unsafeUnwrap());
-    }
+    const bootstrapAddrs = this.options.bootstrapAddrs ?? [];
 
     // Start the Gossip node
     await this.gossipNode.start(bootstrapAddrs, {
@@ -637,13 +627,28 @@ export class Hub implements HubInterface {
     if (shouldExit) {
       return true;
     } else {
-      if (allowedPeerIds) {
-        this.gossipNode.updateAllowedPeerIds(allowedPeerIds);
-        this.allowedPeerIds = allowedPeerIds;
-      }
+      this.gossipNode.updateAllowedPeerIds(allowedPeerIds);
+      this.allowedPeerIds = allowedPeerIds;
 
       this.gossipNode.updateDeniedPeerIds(deniedPeerIds);
       this.deniedPeerIds = deniedPeerIds;
+
+      if (!this.l2RegistryProvider?.ready) {
+        if (
+          networkConfig.storageRegistryAddress &&
+          networkConfig.keyRegistryAddress &&
+          networkConfig.idRegistryAddress
+        ) {
+          this.l2RegistryProvider?.setAddresses(
+            networkConfig.storageRegistryAddress,
+            networkConfig.keyRegistryAddress,
+            networkConfig.idRegistryAddress,
+          );
+          this.l2RegistryProvider?.start();
+        }
+      }
+
+      log.info({ allowedPeerIds, deniedPeerIds }, "Network config applied");
 
       return false;
     }
@@ -906,26 +911,34 @@ export class Hub implements HubInterface {
   /** Since we don't know if the peer is using SSL or not, we'll attempt to get the SSL version,
    *  and fall back to the non-SSL version
    */
-  private async getHubRpcClient(address: string): Promise<HubRpcClient> {
+  private async getHubRpcClient(address: string, options?: Partial<ClientOptions>): Promise<HubRpcClient> {
     return new Promise((resolve) => {
       try {
-        const sslClientResult = getSSLHubRpcClient(address);
+        const sslClientResult = getSSLHubRpcClient(address, options);
 
         sslClientResult.$.waitForReady(Date.now() + 2000, (err) => {
           if (!err) {
             resolve(sslClientResult);
           } else {
-            resolve(getInsecureHubRpcClient(address));
+            Result.fromThrowable(
+              () => sslClientResult.close(),
+              (e) => e as Error,
+            )();
+            resolve(getInsecureHubRpcClient(address, options));
           }
         });
       } catch (e) {
         // Fall back to insecure client
-        resolve(getInsecureHubRpcClient(address));
+        resolve(getInsecureHubRpcClient(address, options));
       }
     });
   }
 
-  public async getRPCClientForPeer(peerId: PeerId, peer: ContactInfoContent): Promise<HubRpcClient | undefined> {
+  public async getRPCClientForPeer(
+    peerId: PeerId,
+    peer: ContactInfoContent,
+    options?: Partial<ClientOptions>,
+  ): Promise<HubRpcClient | undefined> {
     /*
      * Find the peer's addrs from our peer list because we cannot use the address
      * in the contact info directly
@@ -975,7 +988,7 @@ export class Hub implements HubInterface {
     };
 
     try {
-      return await this.getHubRpcClient(addressInfoToString(ai));
+      return await this.getHubRpcClient(addressInfoToString(ai), options);
     } catch (e) {
       log.error({ error: e, peer, peerId, addressInfo: ai }, "unable to connect to peer");
       // If the peer is unreachable (e.g. behind a firewall), remove it from our address book
@@ -1071,7 +1084,7 @@ export class Hub implements HubInterface {
 
     mergeResult.match(
       (eventId) => {
-        logEvent.info(
+        logEvent.debug(
           `submitIdRegistryEvent success ${eventId}: fid ${event.fid} assigned to ${bytesToHexString(
             event.to,
           )._unsafeUnwrap()} in block ${event.blockNumber}`,
@@ -1092,7 +1105,7 @@ export class Hub implements HubInterface {
 
     mergeResult.match(
       (eventId) => {
-        logEvent.info(
+        logEvent.debug(
           `submitNameRegistryEvent success ${eventId}: fname ${bytesToUtf8String(
             event.fname,
           )._unsafeUnwrap()} assigned to ${bytesToHexString(event.to)._unsafeUnwrap()} in block ${event.blockNumber}`,
@@ -1113,10 +1126,14 @@ export class Hub implements HubInterface {
 
     mergeResult.match(
       (eventId) => {
-        logEvent.info(
-          `submitUserNameProof success ${eventId}: fname ${bytesToUtf8String(
-            usernameProof.name,
-          )._unsafeUnwrap()} assigned to fid: ${usernameProof.fid} at timestamp ${usernameProof.timestamp}`,
+        logEvent.debug(
+          {
+            eventId,
+            name: bytesToUtf8String(usernameProof.name).unwrapOr(""),
+            fid: usernameProof.fid,
+            timestamp: usernameProof.timestamp,
+          },
+          "submitUserNameProof success",
         );
       },
       (e) => {

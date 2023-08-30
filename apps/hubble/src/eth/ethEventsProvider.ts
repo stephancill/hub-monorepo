@@ -18,7 +18,8 @@ import { HubInterface } from "../hubble.js";
 import { logger } from "../utils/logger.js";
 import { WatchContractEvent } from "./watchContractEvent.js";
 import { WatchBlockNumber } from "./watchBlockNumber.js";
-import { formatPercentage } from "../profile/profile.js";
+import { addProgressBar } from "../utils/progressBars.js";
+import { statsd } from "../utils/statsd.js";
 
 const log = logger.child({
   component: "EthEventsProvider",
@@ -61,6 +62,7 @@ export class EthEventsProvider {
   // Whether the historical events have been synced. This is used to avoid
   // syncing the events multiple times.
   private _isHistoricalSyncDone = false;
+  private _isHandlingBlock = false;
 
   // Number of blocks to wait before processing an event. This is hardcoded to
   // 3 for now, since we're on testnet and we want to recognize user
@@ -248,8 +250,8 @@ export class EthEventsProvider {
   private async connectAndSyncHistoricalEvents() {
     const latestBlockResult = await ResultAsync.fromPromise(this._publicClient.getBlockNumber(), (err) => err);
     if (latestBlockResult.isErr()) {
-      logger.fatal(latestBlockResult.error);
-      logger.fatal("Failed to connect to ethereum node. Check your eth RPC URL (e.g. --eth-rpc-url)");
+      log.fatal(latestBlockResult.error);
+      log.fatal("Failed to connect to ethereum node. Check your eth RPC URL (e.g. --eth-rpc-url)");
       throw new HubError("unknown", {
         message: "Failed to connect to ethereum node.",
         cause: latestBlockResult.error as Error,
@@ -298,10 +300,14 @@ export class EthEventsProvider {
      * For the 2nd run, fromBlock = 7,648,795 + (1 * 10,000) + 1 =  7,658,796
      * For the 2nd run, toBlock = 7,658,796 + 10,000 =  7,668,796
      */
-
     if (lastSyncedBlock < toBlock) {
       const totalBlocks = toBlock - fromBlock;
       const numOfRuns = Math.ceil(totalBlocks / this._chunkSize);
+
+      let progressBar;
+      if (totalBlocks > 100) {
+        progressBar = addProgressBar("Syncing Farcaster L1 Contracts", totalBlocks);
+      }
 
       for (let i = 0; i < numOfRuns; i++) {
         let nextFromBlock = fromBlock + i * this._chunkSize;
@@ -312,10 +318,9 @@ export class EthEventsProvider {
           nextFromBlock += 1;
         }
 
-        log.info(
-          { fromBlock: nextFromBlock, toBlock: nextToBlock },
-          `syncing events (${formatPercentage((nextFromBlock - fromBlock) / totalBlocks)}) `,
-        );
+        progressBar?.update(Math.max(nextFromBlock - fromBlock - 1, 0));
+
+        statsd().increment("ethevents.blocks", Math.min(toBlock, nextToBlock) - nextFromBlock);
 
         // Sync old Id events
         await this.syncHistoricalIdEvents(nextFromBlock, nextToBlock);
@@ -326,6 +331,9 @@ export class EthEventsProvider {
         // We don't need to sync historical Renew events because the expiry
         // is pulled when NameRegistryEvents are merged
       }
+
+      progressBar?.update(totalBlocks);
+      progressBar?.stop();
     }
 
     this._isHistoricalSyncDone = true;
@@ -512,7 +520,14 @@ export class EthEventsProvider {
 
   /** Handle a new block. Processes all events in the cache that have now been confirmed */
   private async handleNewBlock(blockNumber: number) {
+    // Don't let multiple blocks be handled at once
+    while (this._isHandlingBlock) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    this._isHandlingBlock = true;
     log.info({ blockNumber }, `new block: ${blockNumber}`);
+    statsd().increment("ethevents.blocks");
 
     // Get all blocks that have been confirmed into a single array and sort.
     const cachedBlocksSet = new Set([
@@ -522,6 +537,17 @@ export class EthEventsProvider {
     ]);
     const cachedBlocks = Array.from(cachedBlocksSet);
     cachedBlocks.sort();
+
+    let progressBar;
+    let firstBlock = 0;
+    let totalBlocks = 0;
+    if (cachedBlocks.length > 100) {
+      // Lots of blocks, so show a progress bar
+      const lastBlock = cachedBlocks[cachedBlocks.length - 1] ?? 0;
+      firstBlock = cachedBlocks[0] ?? 0;
+      totalBlocks = lastBlock - firstBlock;
+      progressBar = addProgressBar("Processing Farcaster L1 Contract Events", totalBlocks);
+    }
 
     for (const cachedBlock of cachedBlocks) {
       if (cachedBlock + EthEventsProvider.numConfirmations <= blockNumber) {
@@ -570,7 +596,12 @@ export class EthEventsProvider {
 
         this._retryDedupMap.delete(cachedBlock);
       }
+
+      progressBar?.update(cachedBlock - firstBlock);
     }
+
+    progressBar?.update(totalBlocks);
+    progressBar?.stop();
 
     // Update the last synced block if all the historical events have been synced
     if (this._isHistoricalSyncDone) {
@@ -583,6 +614,7 @@ export class EthEventsProvider {
       }
     }
 
+    this._isHandlingBlock = false;
     this._lastBlockNumber = blockNumber;
   }
 
@@ -597,6 +629,8 @@ export class EthEventsProvider {
     index: number,
   ): HubAsyncResult<void> {
     const logEvent = log.child({ event: { to, id: id.toString(), blockNumber } });
+
+    statsd().gauge("contracts.block_number", blockNumber);
 
     const serialized = Result.combine([
       from && from.length > 0 ? hexStringToBytes(from) : ok(new Uint8Array()),
