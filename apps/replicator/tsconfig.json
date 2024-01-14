@@ -1,6 +1,26 @@
 {
-  "extends": "../../tsconfig.json",
   "compilerOptions": {
+    /* Needed to import CJS modules like Jest */
+    "allowSyntheticDefaultImports": true,
+
+    /* Emit additional JS to ease support for importing CJS modules. This enables `allowSyntheticDefaultImports` for type compatibility. */
+    "esModuleInterop": true,
+    "sourceMap": true,
+
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    "strict": true,
+    "allowUnreachableCode": false,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": false, // causes hard failures when iterating in dev, enforce with instead
+    "noUnusedParameters": false,
+
     "resolveJsonModule": true,
     "moduleResolution": "node",
     // BullMQ doesn't support ESM
@@ -8,7 +28,13 @@
     "module": "commonjs",
     "baseUrl": "./src",
     "outDir": "build",
-    "rootDir": "src"
+    "rootDir": "src",
+    "target": "ES2017"
   },
+
+  "ts-node": {
+    "swc": true
+  },
+
   "exclude": ["node_modules", "jest.config.ts"]
 }
