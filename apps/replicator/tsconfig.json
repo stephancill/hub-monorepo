@@ -29,7 +29,7 @@
     "baseUrl": "./src",
     "outDir": "build",
     "rootDir": "src",
-    "target": "ES2017"
+    "target": "ES2022"
   },
 
   "ts-node": {
