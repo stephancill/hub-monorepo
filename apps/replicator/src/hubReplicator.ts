@@ -1,4 +1,10 @@
-import { HubEvent, HubEventType, HubRpcClient, OnChainEvent, isHubError } from "@farcaster/hub-nodejs";
+import {
+  HubEvent,
+  HubEventType,
+  HubRpcClient,
+  OnChainEvent,
+  isHubError,
+} from "@farcaster/hub-nodejs";
 import humanizeDuration from "humanize-duration";
 import { Redis, RedisKey } from "ioredis";
 import { sql } from "kysely";
@@ -22,7 +28,7 @@ export class HubReplicator {
     private hubAddress: string,
     private db: DB,
     private log: Logger,
-    private redis: Redis,
+    private redis: Redis
   ) {
     this.eventsSubscriber = new HubSubscriber("all-events", this.hub, log, [
       HubEventType.MERGE_ON_CHAIN_EVENT,
@@ -57,7 +63,9 @@ export class HubReplicator {
   private async processHubEvent(hubEvent: HubEvent) {
     // Immediately enqueue so that we don't block consumption of the event stream
     // (hub will close connection if we get too far behind)
-    await ProcessHubEvent.enqueue({ hubEventJsonStr: JSON.stringify(HubEvent.toJSON(hubEvent)) });
+    await ProcessHubEvent.enqueue({
+      hubEventJsonStr: JSON.stringify(HubEvent.toJSON(hubEvent)),
+    });
   }
 
   private async updateTableMetrics() {
@@ -80,10 +88,12 @@ export class HubReplicator {
           ] satisfies Array<keyof Tables>
         ).map((tableName) =>
           selectFrom(tableName)
-            .select(({ fn }) => fn.coalesce(fn.countAll<number>(), sql<number>`0`).as(tableName))
-            .as(tableName),
-        ),
-      ),
+            .select(({ fn }) =>
+              fn.coalesce(fn.countAll<number>(), sql<number>`0`).as(tableName)
+            )
+            .as(tableName)
+        )
+      )
     );
 
     for (const [tableName, count] of Object.entries(stats)) {
@@ -98,14 +108,19 @@ export class HubReplicator {
     }
 
     const maxFidResult = await this.hub.getFids({ pageSize: 1, reverse: true });
-    if (maxFidResult.isErr()) throw new Error("Unable to get latest FID", { cause: maxFidResult.error });
+    if (maxFidResult.isErr())
+      throw new Error("Unable to get latest FID", {
+        cause: maxFidResult.error,
+      });
 
     const maxFid = maxFidResult.value.fids[0];
     if (!maxFid) throw new AssertionError("Max FID was undefined");
 
     // If the last event we processed no longer exists on the hub, then we're too
     // far behind to catch up using the event stream alone.
-    const lastEventId = Number((await this.redis.get(this.lastHubEventIdKey)) ?? "0");
+    const lastEventId = Number(
+      (await this.redis.get(this.lastHubEventIdKey)) ?? "0"
+    );
     let tooFarBehind = false;
     try {
       this.hub.getEvent({ id: lastEventId });
@@ -130,27 +145,41 @@ export class HubReplicator {
           "backfilled-userdata",
           "backfilled-username-proofs",
           "backfilled-other-onchain-events",
-        ].map((key) => this.redis.del(key)),
+        ].map((key) => this.redis.del(key))
       );
     }
 
-    // First ensure all current FIDs are backfilled, since many messages have a foreign key to fids table
-    await this.waitForFidRegistrationsBackfill({ maxFid });
+    if (!process.env["SKIP_BACKFILL"]) {
+      // First ensure all current FIDs are backfilled, since many messages have a foreign key to fids table
+      await this.waitForFidRegistrationsBackfill({ maxFid });
 
-    // Then kick off backfill of all other data
-    await Promise.all([this.enqueueBackfillJobs({ maxFid }), this.waitForOtherChainEventsBackfill({ maxFid })]);
+      // Then kick off backfill of all other data
+      await Promise.all([
+        this.enqueueBackfillJobs({ maxFid }),
+        this.waitForOtherChainEventsBackfill({ maxFid }),
+      ]);
+    }
 
     // Finally, once all events have been processed, we can start subscribing to the event stream
     // and processing new events as they come in while backfilling messages.
     void this.eventsSubscriber.start();
   }
 
-  private async waitForFidRegistrationsBackfill({ maxFid }: { maxFid: number }) {
-    this.log.info(`Enqueuing jobs for backfilling FID registrations for ${maxFid} FIDs...`);
+  private async waitForFidRegistrationsBackfill({
+    maxFid,
+  }: {
+    maxFid: number;
+  }) {
+    this.log.info(
+      `Enqueuing jobs for backfilling FID registrations for ${maxFid} FIDs...`
+    );
 
     const jobs: Parameters<typeof BackfillFidRegistration.enqueueBulk>[0] = [];
     for (let fid = maxFid; fid > 0; fid--) {
-      const alreadyBackfilled = await this.redis.sismember("backfilled-registrations", fid);
+      const alreadyBackfilled = await this.redis.sismember(
+        "backfilled-registrations",
+        fid
+      );
       if (alreadyBackfilled) continue;
       jobs.push({
         args: { fid },
@@ -160,14 +189,17 @@ export class HubReplicator {
     await BackfillFidRegistration.enqueueBulk(jobs);
 
     const startTime = Date.now();
-    const alreadyBackfilled = await this.redis.scard("backfilled-registrations");
+    const alreadyBackfilled = await this.redis.scard(
+      "backfilled-registrations"
+    );
     for (;;) {
       const dataBackfilled = await this.redis.scard("backfilled-registrations");
       if (dataBackfilled >= maxFid) break;
 
       const elapsedMs = Date.now() - startTime;
       const millisRemaining = Math.ceil(
-        (elapsedMs / (dataBackfilled - alreadyBackfilled)) * (maxFid - alreadyBackfilled - dataBackfilled),
+        (elapsedMs / (dataBackfilled - alreadyBackfilled)) *
+          (maxFid - alreadyBackfilled - dataBackfilled)
       );
       const timeRemaining =
         millisRemaining === Infinity || millisRemaining > 864000000
@@ -175,12 +207,14 @@ export class HubReplicator {
           : humanizeDuration(millisRemaining, { round: true });
 
       this.log.info(
-        `Backfilled registrations for ${dataBackfilled} of ${maxFid} FIDs. Estimated time remaining: ${timeRemaining}`,
+        `Backfilled registrations for ${dataBackfilled} of ${maxFid} FIDs. Estimated time remaining: ${timeRemaining}`
       );
       await sleep(5_000);
     }
     this.log.info(
-      `Finished backfilling registrations for ${maxFid} FIDs. Total time: ${humanizeDuration(Date.now() - startTime)}`,
+      `Finished backfilling registrations for ${maxFid} FIDs. Total time: ${humanizeDuration(
+        Date.now() - startTime
+      )}`
     );
   }
 
@@ -194,29 +228,40 @@ export class HubReplicator {
     }
   }
 
-  private async waitForOtherChainEventsBackfill({ maxFid }: { maxFid: number }) {
+  private async waitForOtherChainEventsBackfill({
+    maxFid,
+  }: {
+    maxFid: number;
+  }) {
     let startTime = Date.now();
-    const alreadyBackfilled = await this.redis.scard("backfilled-other-onchain-events");
+    const alreadyBackfilled = await this.redis.scard(
+      "backfilled-other-onchain-events"
+    );
 
     for (;;) {
-      const dataBackfilled = await this.redis.scard("backfilled-other-onchain-events");
+      const dataBackfilled = await this.redis.scard(
+        "backfilled-other-onchain-events"
+      );
       if (dataBackfilled >= maxFid) break;
 
       const elapsedMs = Date.now() - startTime;
       const millisRemaining = Math.ceil(
-        (elapsedMs / (dataBackfilled - alreadyBackfilled)) * (maxFid - alreadyBackfilled - dataBackfilled),
+        (elapsedMs / (dataBackfilled - alreadyBackfilled)) *
+          (maxFid - alreadyBackfilled - dataBackfilled)
       );
       const timeRemaining =
         millisRemaining === Infinity || millisRemaining > 864000000
           ? "Calculating..."
           : humanizeDuration(millisRemaining, { round: true });
       this.log.info(
-        `Backfilled events for ${dataBackfilled} of ${maxFid} FIDs. Estimated time remaining: ${timeRemaining}`,
+        `Backfilled events for ${dataBackfilled} of ${maxFid} FIDs. Estimated time remaining: ${timeRemaining}`
       );
       await sleep(5_000);
     }
     this.log.info(
-      `Finished backfilling events for ${maxFid} FIDs. Total time: ${humanizeDuration(Date.now() - startTime)}`,
+      `Finished backfilling events for ${maxFid} FIDs. Total time: ${humanizeDuration(
+        Date.now() - startTime
+      )}`
     );
 
     // Now that all other onchain events are backfilled, we are safe to process them in order.
@@ -224,7 +269,9 @@ export class HubReplicator {
     // storage allocations require linear ordering.
     startTime = Date.now();
     this.log.info(`Beginning in-order processing of events for ${maxFid} FIDs`);
-    const { blockNumber, logIndex } = await this.redis.hgetall("processed-onchain-events-watermark");
+    const { blockNumber, logIndex } = await this.redis.hgetall(
+      "processed-onchain-events-watermark"
+    );
     for await (const { raw } of this.db
       .selectFrom("chainEvents")
       .select("raw")
@@ -234,7 +281,7 @@ export class HubReplicator {
             qb
               .where("blockNumber", ">=", Number(blockNumber))
               .where("logIndex", ">", Number(logIndex))
-          : qb,
+          : qb
       )
       .stream()) {
       const onChainEvent = OnChainEvent.decode(raw);
@@ -250,7 +297,9 @@ export class HubReplicator {
     }
 
     this.log.info(
-      `Completed in-order processing of onchain events. Total time: ${humanizeDuration(Date.now() - startTime)}`,
+      `Completed in-order processing of onchain events. Total time: ${humanizeDuration(
+        Date.now() - startTime
+      )}`
     );
   }
 }
