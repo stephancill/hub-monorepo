@@ -17,6 +17,7 @@ import {
   MessageType,
   OnChainEvent,
   OnChainEventType,
+  Protocol,
   ReactionAddMessage,
   ReactionType,
   RevokeMessageHubEvent,
@@ -27,7 +28,9 @@ import {
   UserNameProof,
   UserNameType,
   utf8StringToBytes,
-  VerificationAddEthAddressMessage,
+  base58ToBytes,
+  VerificationAddAddressMessage,
+  recreateSolanaClaimMessage,
 } from "@farcaster/hub-nodejs";
 import { err, Ok, ok } from "neverthrow";
 import { jestRocksDB } from "../db/jestUtils.js";
@@ -35,7 +38,7 @@ import Engine from "../engine/index.js";
 import { sleep } from "../../utils/crypto.js";
 import { getMessage, makeTsHash, typeToSetPostfix } from "../db/message.js";
 import { StoreEvents } from "../stores/storeEventHandler.js";
-import { IdRegisterOnChainEvent, makeVerificationEthAddressClaim } from "@farcaster/core";
+import { IdRegisterOnChainEvent, makeVerificationAddressClaim } from "@farcaster/core";
 import { setReferenceDateForTest } from "../../utils/versions.js";
 import { getUserNameProof } from "../db/nameRegistryEvent.js";
 import { publicClient } from "../../test/utils.js";
@@ -60,7 +63,7 @@ let signerRemoveEvent: OnChainEvent;
 let castAdd: CastAddMessage;
 let reactionAdd: ReactionAddMessage;
 let linkAdd: LinkAddMessage;
-let verificationAdd: VerificationAddEthAddressMessage;
+let verificationAdd: VerificationAddAddressMessage;
 let userDataAdd: UserDataAddMessage;
 
 beforeAll(async () => {
@@ -91,6 +94,16 @@ beforeAll(async () => {
     { data: { fid, network, userDataBody: { type: UserDataType.PFP } } },
     { transient: { signer } },
   );
+});
+
+beforeEach(async () => {
+  engine.clearCache();
+  engine.setSolanaVerifications(false);
+});
+
+afterAll(async () => {
+  await engine.stop();
+  await db.close();
 });
 
 describe("mergeOnChainEvent", () => {
@@ -173,11 +186,11 @@ describe("mergeMessage", () => {
       });
     });
 
-    describe("VerificationAddEthAddress", () => {
-      test("succeeds", async () => {
+    describe("VerificationAddAddress", () => {
+      test("succeeds for eth", async () => {
         await expect(engine.mergeMessage(verificationAdd)).resolves.toBeInstanceOf(Ok);
         await expect(
-          engine.getVerification(fid, verificationAdd.data.verificationAddEthAddressBody.address),
+          engine.getVerification(fid, verificationAdd.data.verificationAddAddressBody.address),
         ).resolves.toEqual(ok(verificationAdd));
         expect(mergedMessages).toEqual([verificationAdd]);
       });
@@ -185,11 +198,12 @@ describe("mergeMessage", () => {
       test("fails when network does not match claim network", async () => {
         const address = custodySignerKey;
         const blockHash = Factories.BlockHash.build();
-        const mainnetClaim = await makeVerificationEthAddressClaim(
+        const mainnetClaim = await makeVerificationAddressClaim(
           fid,
           address,
           FarcasterNetwork.MAINNET,
           blockHash,
+          Protocol.ETHEREUM,
         )._unsafeUnwrap();
         const claimSignature = (await custodySigner.signVerificationEthAddressClaim(mainnetClaim))._unsafeUnwrap();
         const testnetVerificationAdd = await Factories.VerificationAddEthAddressMessage.create(
@@ -197,19 +211,121 @@ describe("mergeMessage", () => {
             data: {
               fid,
               network: FarcasterNetwork.TESTNET,
-              verificationAddEthAddressBody: { address: address, blockHash: blockHash, ethSignature: claimSignature },
+              verificationAddAddressBody: {
+                address: address,
+                blockHash: blockHash,
+                claimSignature: claimSignature,
+              },
             },
           },
           { transient: { signer: signer, ethSigner: custodySigner } },
         );
         const result = await engine.mergeMessage(testnetVerificationAdd);
         // Signature will not match because we're attempting to recover the address based on the wrong network
-        expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid ethSignature")));
+        expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid claimSignature")));
+      });
+
+      test("fails for solana verifications by default", async () => {
+        const verificationAdd = await Factories.VerificationAddSolAddressMessage.create(
+          { data: { fid, network } },
+          { transient: { signer } },
+        );
+
+        const result = await engine.mergeMessage(verificationAdd);
+        expect(result).toEqual(
+          err(new HubError("bad_request.validation_failure", "solana verifications are not enabled")),
+        );
+      });
+
+      test("succeeds for solana verifications when enabled", async () => {
+        engine.setSolanaVerifications(true);
+        const verificationAdd = await Factories.VerificationAddSolAddressMessage.create(
+          { data: { fid, network } },
+          { transient: { signer } },
+        );
+
+        await expect(engine.mergeMessage(verificationAdd)).resolves.toBeInstanceOf(Ok);
+        await expect(
+          engine.getVerification(fid, verificationAdd.data.verificationAddAddressBody.address),
+        ).resolves.toEqual(ok(verificationAdd));
+        expect(mergedMessages).toEqual([verificationAdd]);
+      });
+
+      test("fails when sol signature does not match fid", async () => {
+        engine.setSolanaVerifications(true);
+        const solAddress = Factories.SolAddress.build();
+        const solanaSigner = Factories.Ed25519Signer.build();
+        const blockHash = Factories.BlockHash.build();
+        const claim = Factories.VerificationSolAddressClaim.build({
+          fid: BigInt(fid + 1),
+          network: FarcasterNetwork.MAINNET,
+          blockHash: Buffer.from(blockHash).toString("utf-8"),
+          address: Buffer.from(solAddress).toString("utf-8"),
+          protocol: Protocol.SOLANA,
+        });
+        const claimSignature = (
+          await solanaSigner.signMessageHash(recreateSolanaClaimMessage(claim, solAddress))
+        )._unsafeUnwrap();
+
+        const badVerificationAdd = await Factories.VerificationAddSolAddressMessage.create(
+          {
+            data: {
+              fid,
+              network,
+              verificationAddAddressBody: {
+                address: solAddress,
+                blockHash,
+                claimSignature,
+                protocol: Protocol.SOLANA,
+              },
+            },
+          },
+          { transient: { signer } },
+        );
+
+        const result = await engine.mergeMessage(badVerificationAdd);
+        // Signature will not match because we're attempting to recover the address based on the wrong fid
+        expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid claimSignature")));
+      });
+
+      test("with a valid externally generated solana claim signature", async () => {
+        engine.setSolanaVerifications(true);
+        const solanaSignerFid = 123;
+        const solanaFidCustodyEvent = Factories.IdRegistryOnChainEvent.build({ fid: solanaSignerFid });
+        const solanaFidsignerAddEvent = Factories.SignerOnChainEvent.build(
+          { fid: solanaSignerFid },
+          { transient: { signer: signerKey } },
+        );
+        const solanaFidStorageEvent = Factories.StorageRentOnChainEvent.build({ fid: solanaSignerFid });
+        await engine.mergeOnChainEvent(solanaFidCustodyEvent);
+        await engine.mergeOnChainEvent(solanaFidsignerAddEvent);
+        await engine.mergeOnChainEvent(solanaFidStorageEvent);
+
+        const verificationAdd = await Factories.VerificationAddSolAddressMessage.create(
+          {
+            data: {
+              fid: solanaSignerFid,
+              network,
+              verificationAddAddressBody: {
+                address: base58ToBytes("8WoeDTF9535N6tnmjyyMukwcAM1exHZr6tUsmbWefgYz")._unsafeUnwrap(),
+                protocol: Protocol.SOLANA,
+                claimSignature: hexStringToBytes(
+                  "d1ffa68a4f4a6d1046ed827760e530eff85e76c6bfcb63ccedc45d293f00425658f2825670bbfaf8304c3d715d456f521616705463039983713f8e4f9574be03",
+                )._unsafeUnwrap(),
+                blockHash: base58ToBytes("7hAHBEYX84W4jzQ8P6UJioymYu6Rnhp1CLsBW5B7zpzU")._unsafeUnwrap(),
+              },
+            },
+          },
+          { transient: { signer } },
+        );
+
+        const result = await engine.mergeMessage(verificationAdd);
+        expect(result).toBeInstanceOf(Ok);
       });
 
       describe("validateOrRevokeMessage", () => {
         let mergedMessage: Message;
-        let verifications: VerificationAddEthAddressMessage[] = [];
+        let verifications: VerificationAddAddressMessage[] = [];
 
         const getVerifications = async () => {
           const verificationsResult = await engine.getVerificationsByFid(fid);
@@ -223,7 +339,7 @@ describe("mergeMessage", () => {
             {
               data: {
                 fid,
-                verificationAddEthAddressBody: Factories.VerificationAddEthAddressBody.build({
+                verificationAddAddressBody: Factories.VerificationAddAddressBody.build({
                   chainId: 1,
                   verificationType: 1,
                 }),
@@ -631,7 +747,7 @@ describe("mergeMessage", () => {
     test("succeeds for valid proof for verified eth address", async () => {
       await engine.mergeMessage(verificationAdd);
       const verificationAddress = bytesToHexString(
-        verificationAdd.data.verificationAddEthAddressBody.address,
+        verificationAdd.data.verificationAddAddressBody.address,
       )._unsafeUnwrap();
       jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
         return Promise.resolve(verificationAddress);
@@ -675,7 +791,7 @@ describe("mergeMessage", () => {
       beforeEach(async () => {
         const custodyAddress = bytesToHexString(custodyEvent.idRegisterEventBody.to)._unsafeUnwrap();
         const verificationAddress = bytesToHexString(
-          verificationAdd.data.verificationAddEthAddressBody.address,
+          verificationAdd.data.verificationAddAddressBody.address,
         )._unsafeUnwrap();
 
         jest.spyOn(publicClient, "getEnsAddress").mockImplementation((opts) => {
@@ -746,7 +862,7 @@ describe("mergeMessage", () => {
             data: {
               fid,
               timestamp: verificationAdd.data.timestamp + 2,
-              verificationRemoveBody: { address: verificationAdd.data.verificationAddEthAddressBody.address },
+              verificationRemoveBody: { address: verificationAdd.data.verificationAddAddressBody.address },
             },
           },
           { transient: { signer } },

@@ -72,6 +72,7 @@ import {
   performDbMigrations,
 } from "./storage/db/migrations/migrations.js";
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 import path from "path";
 import { addProgressBar } from "./utils/progressBars.js";
 import * as fs from "fs";
@@ -80,7 +81,7 @@ import { HttpAPIServer } from "./rpc/httpServer.js";
 import { SingleBar } from "cli-progress";
 import { exportToProtobuf } from "@libp2p/peer-id-factory";
 import OnChainEventStore from "./storage/stores/onChainEventStore.js";
-import { ensureMessageData } from "./storage/db/message.js";
+import { ensureMessageData, isMessageInDB } from "./storage/db/message.js";
 import { getFarcasterTime } from "@farcaster/core";
 
 export type HubSubmitSource = "gossip" | "rpc" | "eth-provider" | "l2-provider" | "sync" | "fname-registry";
@@ -91,7 +92,7 @@ export const APP_NICKNAME = process.env["HUBBLE_NAME"] ?? "Farcaster Hub";
 export const SNAPSHOT_S3_DEFAULT_BUCKET = "download.farcaster.xyz";
 export const S3_REGION = "us-east-1";
 
-export const FARCASTER_VERSION = "2023.12.27";
+export const FARCASTER_VERSION = "2024.2.7";
 export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: "2023.3.1", expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
   { version: "2023.4.19", expiresAt: 1686700800000 }, // expires at 6/14/23 00:00 UTC
@@ -101,6 +102,7 @@ export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: "2023.10.4", expiresAt: 1701216000000 }, // expires at 11/28/23 00:00 UTC
   { version: "2023.11.15", expiresAt: 1704844800000 }, // expires at 1/10/24 00:00 UTC
   { version: "2023.12.27", expiresAt: 1708473600000 }, // expires at 2/21/24 00:00 UTC
+  { version: "2024.2.7", expiresAt: 1712102400000 }, // expires at 4/3/24 00:00 UTC
 ];
 
 const MAX_CONTACT_INFO_AGE_MS = GOSSIP_SEEN_TTL;
@@ -283,6 +285,9 @@ export interface HubOptions {
 
   /** If set, requires gossip messages to utilize StrictNoSign */
   strictNoSign?: boolean;
+
+  /** Should we connect to DB peers on startup */
+  connectToDbPeers?: boolean;
 }
 
 /** @returns A randomized string of the format `rocksdb.tmp.*` used for the DB Name */
@@ -309,6 +314,7 @@ export class Hub implements HubInterface {
   private allowlistedImmunePeers: string[] | undefined;
   private strictContactInfoValidation: boolean;
   private strictNoSign: boolean;
+  private performedFirstSync = false;
 
   private s3_snapshot_bucket: string;
 
@@ -371,13 +377,13 @@ export class Hub implements HubInterface {
     }
 
     this.rocksDB = new RocksDB(options.rocksDBName ? options.rocksDBName : randomDbName());
-    this.gossipNode = new GossipNode(this.options.network);
+    this.gossipNode = new GossipNode(this.rocksDB, this.options.network);
 
     this.s3_snapshot_bucket = options.s3SnapshotBucket ?? SNAPSHOT_S3_DEFAULT_BUCKET;
 
     const eventHandler = new StoreEventHandler(this.rocksDB, {
       lockMaxPending: options.commitLockMaxPending,
-      lockTimeout: options.commitLockTimeout,
+      lockExecutionTimeout: options.commitLockTimeout,
     });
 
     const opMainnetRpcUrls = options.l2RpcUrl.split(",");
@@ -648,7 +654,12 @@ export class Hub implements HubInterface {
         }
       }
     }
+
+    // Start the CRDT engine
     await this.engine.start();
+
+    // Start the sync engine
+    await this.syncEngine.start(this.options.rebuildSyncTrie ?? false);
 
     // Start the RPC server
     await this.rpcServer.start(this.options.rpcServerHost, this.options.rpcPort ?? 0);
@@ -663,9 +674,6 @@ export class Hub implements HubInterface {
 
     await this.l2RegistryProvider.start();
     await this.fNameRegistryEventsProvider.start();
-
-    // Start the sync engine
-    await this.syncEngine.start(this.options.rebuildSyncTrie ?? false);
 
     const bootstrapAddrs = this.options.bootstrapAddrs ?? [];
 
@@ -683,6 +691,7 @@ export class Hub implements HubInterface {
       allowlistedImmunePeers: this.options.allowlistedImmunePeers,
       applicationScoreCap: this.options.applicationScoreCap,
       strictNoSign: this.strictNoSign,
+      connectToDbPeers: this.options.connectToDbPeers,
     });
 
     await this.registerEventHandlers();
@@ -722,6 +731,7 @@ export class Hub implements HubInterface {
       strictContactInfoValidation,
       strictNoSign,
       shouldExit,
+      solanaVerificationsEnabled,
     } = applyNetworkConfig(
       networkConfig,
       this.allowedPeerIds,
@@ -730,6 +740,7 @@ export class Hub implements HubInterface {
       this.options.allowlistedImmunePeers,
       this.options.strictContactInfoValidation,
       this.options.strictNoSign,
+      this.engine.solanaVerficationsEnabled,
     );
 
     if (shouldExit) {
@@ -745,6 +756,10 @@ export class Hub implements HubInterface {
       this.strictContactInfoValidation = !!strictContactInfoValidation;
       const shouldRestart = this.strictNoSign !== !!strictNoSign;
       this.strictNoSign = !!strictNoSign;
+
+      if (solanaVerificationsEnabled) {
+        this.engine.setSolanaVerifications(true);
+      }
 
       log.info({ allowedPeerIds, deniedPeerIds, allowlistedImmunePeers }, "Network config applied");
 
@@ -998,6 +1013,18 @@ export class Hub implements HubInterface {
   /* -------------------------------------------------------------------------- */
 
   private async handleGossipMessage(gossipMessage: GossipMessage, source: PeerId, msgId: string): HubAsyncResult<void> {
+    let reportedAsInvalid = false;
+    if (gossipMessage.timestamp) {
+      // If message is older than seenTTL, we will try to merge it, but report it as invalid so it doesn't
+      // propogate across the network
+      const cutOffTime = getFarcasterTime().unwrapOr(0) - GOSSIP_SEEN_TTL;
+
+      if (gossipMessage.timestamp < cutOffTime) {
+        await this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), false);
+        reportedAsInvalid = true;
+      }
+    }
+
     const peerIdResult = Result.fromThrowable(
       () => peerIdFromBytes(gossipMessage.peerId ?? new Uint8Array([])),
       (error) => new HubError("bad_request.parse_failure", error as Error),
@@ -1022,34 +1049,45 @@ export class Hub implements HubInterface {
         return err(new HubError("unavailable", "Sync queue is full"));
       }
 
+      const currentTime = getFarcasterTime().unwrapOr(0);
+      const messageFirstGossipedTime = gossipMessage.timestamp ?? 0;
+      const gossipMessageDelay = currentTime - messageFirstGossipedTime;
+
       // Merge the message
       const result = await this.submitMessage(message, "gossip");
       if (result.isOk()) {
-        this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), true);
-        const currentTime = getFarcasterTime().unwrapOr(0);
-        const messageCreatedTime = message.data?.timestamp ?? 0;
-        // The message time is user provided, so, while not ideal, it's still good enough to use most of the time
-        if (currentTime > 0 && messageCreatedTime > 0 && currentTime > messageCreatedTime) {
-          const diff = currentTime - messageCreatedTime;
-          statsd().timing("gossip.message_delay", diff);
+        if (!reportedAsInvalid) {
+          await this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), true);
         }
       } else {
         log.info(
           {
             errCode: result.error.errCode,
+            errMsg: result.error.message,
             peerId: source.toString(),
             origin: peerIdResult.value,
             hash: bytesToHexString(message.hash).unwrapOr(""),
+            fid: message.data?.fid,
+            type: message.data?.type,
+            gossipDelay: gossipMessageDelay,
+            valid: !reportedAsInvalid,
             msgId,
           },
           "Received bad gossip message from peer",
         );
-        this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), false);
+        if (!reportedAsInvalid) {
+          await this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), false);
+        }
       }
+
+      statsd().timing("gossip.message_delay", gossipMessageDelay);
+      const mergeResult = result.isOk() ? "success" : "failure";
+      statsd().timing(`gossip.message_delay.${mergeResult}`, gossipMessageDelay);
+
       return result.map(() => undefined);
     } else if (gossipMessage.contactInfoContent) {
       const result = await this.handleContactInfo(peerIdResult.value, gossipMessage.contactInfoContent);
-      this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), result);
+      await this.gossipNode.reportValid(msgId, peerIdFromString(source.toString()).toBytes(), result);
       return ok(undefined);
     } else {
       return err(new HubError("bad_request.invalid_param", "invalid message type"));
@@ -1175,7 +1213,10 @@ export class Hub implements HubInterface {
 
     // Check if we already have this client
     const result = this.syncEngine.addContactInfoForPeerId(peerId, message);
-    if (result.isOk()) {
+    if (result.isOk() && !this.performedFirstSync) {
+      // Should only sync last ~day worth of messages with new peers. For now, only sync with the first peer so we are upto
+      // date on startup.
+      log.debug({ peerInfo: message }, "New peer but only performing first sync");
       const syncResult = await ResultAsync.fromPromise(
         this.syncEngine.diffSyncIfRequired(this, peerId.toString()),
         (e) => e,
@@ -1183,6 +1224,7 @@ export class Hub implements HubInterface {
       if (syncResult.isErr()) {
         log.error({ error: syncResult.error, peerId }, "Failed to sync with new peer");
       }
+      this.performedFirstSync = true;
     } else {
       log.debug({ peerInfo: message }, "Already have this peer, skipping sync");
     }
@@ -1322,6 +1364,12 @@ export class Hub implements HubInterface {
   /* -------------------------------------------------------------------------- */
 
   async submitMessage(submittedMessage: Message, source?: HubSubmitSource): HubAsyncResult<number> {
+    // If this is a dup, don't bother processing it
+    if (await isMessageInDB(this.rocksDB, submittedMessage)) {
+      log.debug({ source }, "submitMessage rejected: Message already exists");
+      return err(new HubError("bad_request.duplicate", "message has already been merged"));
+    }
+
     // message is a reserved key in some logging systems, so we use submittedMessage instead
     const logMessage = log.child({
       submittedMessage: messageToLog(submittedMessage),
@@ -1336,6 +1384,7 @@ export class Hub implements HubInterface {
     const start = Date.now();
 
     const message = ensureMessageData(submittedMessage);
+    const type = messageTypeToName(message.data?.type);
     const mergeResult = await this.engine.mergeMessage(message);
 
     mergeResult.match(
@@ -1343,7 +1392,7 @@ export class Hub implements HubInterface {
         const logData = {
           eventId,
           fid: message.data?.fid,
-          type: messageTypeToName(message.data?.type),
+          type: type,
           submittedMessage: messageToLog(submittedMessage),
           source,
         };
@@ -1366,7 +1415,9 @@ export class Hub implements HubInterface {
       void this.gossipNode.gossipMessage(message);
     }
 
-    statsd().timing("hub.merge_message", Date.now() - start);
+    const now = Date.now();
+    statsd().timing("hub.merge_message", now - start);
+    statsd().timing(`hub.merge_message.${type}`, now - start);
 
     return mergeResult;
   }
@@ -1533,11 +1584,17 @@ export class Hub implements HubInterface {
       log.error(`S3 File Error: ${err}`);
     });
 
-    const targzParams = {
-      Bucket: this.s3_snapshot_bucket,
-      Key: key,
-      Body: fileStream,
-    };
+    // The targz should be uploaded via multipart upload to S3
+    const targzParams = new Upload({
+      client: s3,
+      params: {
+        Bucket: this.s3_snapshot_bucket,
+        Key: key,
+        Body: fileStream,
+      },
+      queueSize: 4, // 4 concurrent uploads
+      partSize: 1000 * 1024 * 1024, // 1 GB
+    });
 
     const latestJsonParams = {
       Bucket: this.s3_snapshot_bucket,
@@ -1549,8 +1606,12 @@ export class Hub implements HubInterface {
       }),
     };
 
+    targzParams.on("httpUploadProgress", (progress) => {
+      log.info({ progress }, "Uploading snapshot to S3");
+    });
+
     try {
-      await s3.send(new PutObjectCommand(targzParams));
+      await targzParams.done();
       await s3.send(new PutObjectCommand(latestJsonParams));
       log.info({ key, timeTakenMs: Date.now() - start }, "Snapshot uploaded to S3");
       return ok(key);

@@ -28,6 +28,7 @@ import {
   OnChainEventType,
   SignerEventType,
   IdRegisterEventType,
+  Protocol,
 } from "@farcaster/hub-nodejs";
 import * as path from "path";
 import { promises as fs } from "fs";
@@ -203,12 +204,21 @@ export type ReactionBodyJson = ReactionBodyCastJson | ReactionBodyUrlJson;
 
 export type VerificationAddEthAddressBodyJson = {
   address: Hex;
-  ethSignature: Hex;
+  claimSignature: Hex;
   blockHash: Hex;
+  protocol: Protocol;
+};
+
+export type VerificationAddSolAddressBodyJson = {
+  address: string;
+  claimSignature: string;
+  blockHash: string;
+  protocol: Protocol;
 };
 
 export type VerificationRemoveBodyJson = {
   address: Hex;
+  protocol: Protocol;
 };
 
 export type UserDataBodyJson = {
@@ -238,6 +248,7 @@ export type MessageBodyJson =
   | ReactionBodyJson
   | LinkBodyJson
   | VerificationAddEthAddressBodyJson
+  | VerificationAddSolAddressBodyJson
   | VerificationRemoveBodyJson
   | UserDataBodyJson
   | UsernameProofBodyJson;

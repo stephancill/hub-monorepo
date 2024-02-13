@@ -1,5 +1,62 @@
 # @farcaster/hubble
 
+## 1.10.0
+
+### Minor Changes
+
+- ae91b73a: Add Solana verification support
+
+### Patch Changes
+
+- 97a42165: fix: Don't broadcast old messages on gossip
+- d90fb0b5: fix: Increase sync max duration
+- be07bc86: fix: Properly init the merkle trie so we don't miss l2events
+- a9105e20: fix: Add 8G heap to docker commands
+- Updated dependencies [ae91b73a]
+  - @farcaster/hub-nodejs@0.11.0
+
+## 1.9.9
+
+### Patch Changes
+
+- 763d3154: feat: rename some verification message fields to support more protocols
+- 97317971: fix: prefer peers with more messages to sync with
+- c0551bfb: fix: Increase sync timeout
+- 52102c21: fix: Early detect duplicate messages
+- 81f453ab: fix: Process L2 blocks in batches
+- 5a70330b: fix: Reduce Gossip TTL to 5 mins
+- c0e17a49: feat: Add a new DB for trie data
+- 41735d62: feat: Save connected peers in DB
+- f49e9fe4: fix: Use the pendingDbUpdates to decide when to write updates to merkle trie
+- Updated dependencies [763d3154]
+  - @farcaster/hub-nodejs@0.10.24
+
+## 1.9.8
+
+### Patch Changes
+
+- acf985c2: feat: Add neynar hubs to bootstrap list
+- 0a6a7b70: fix: Multipart upload the snapshot to S3
+- 6ec1b4dd: feat: Add a LRU cache to the active signers
+- d29dfe51: fix: Check sync trie before fetching messages
+- 06160b96: perf: Use execution timeout so we don't drop all messages in the lock queue
+- 8bff4de6: fix: Bump gossip TTL to 10 mins
+
+## 1.9.7
+
+### Patch Changes
+
+- 618e6fad: feat: Add quicksync
+- 05ce5fe8: fix: Increase the sync trie cache to 64MB
+- fb011fc5: fix: Minor performance tweaks and logging
+
+## 1.9.6
+
+### Patch Changes
+
+- 577d698d: fix: Remove score penalty for duplicate gossip messages
+- 57ce2c66: fix: reduce sync freqency to help reduce hub load
+
 ## 1.9.5
 
 ### Patch Changes

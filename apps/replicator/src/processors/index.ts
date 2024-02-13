@@ -25,7 +25,7 @@ import {
   isRevokeMessageHubEvent,
   isUserDataAddMessage,
   isUsernameProofMessage,
-  isVerificationAddEthAddressMessage,
+  isVerificationAddAddressMessage,
   isVerificationRemoveMessage,
 } from "@farcaster/hub-nodejs";
 import { Redis } from "ioredis";
@@ -156,7 +156,8 @@ export async function processMessage(
         await processLinkRemove(message, operation, trx);
         break;
       case MessageType.VERIFICATION_ADD_ETH_ADDRESS:
-        if (!isVerificationAddEthAddressMessage(message))
+        // TODO: add support for multi-protoocl verification
+        if (!isVerificationAddAddressMessage(message))
           throw new AssertionError(`Invalid VerificationAddEthAddressMessage: ${message}`);
         log.debug(`Processing VerificationAddEthAddressMessage ${hash} (fid ${fid})`, { fid, hash });
         await processVerificationAddEthAddress(message, operation, trx);

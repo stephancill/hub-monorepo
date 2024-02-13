@@ -58,7 +58,9 @@ describe("gossip network tests", () => {
       await sleep(PROPAGATION_DELAY);
 
       await Promise.all(nodes.map(async (n) => expect((await n.allPeerIds()).length).toBeGreaterThanOrEqual(1)));
-      const randomNode = nodes[Math.floor(Math.random() * nodes.length)] as GossipNode;
+      // Because of how the network is set up, nodes[0] is the bootstrapper and will gossip to every node. So we need to publish from a different node
+      const randomNodeExcept0 = Math.floor(Math.random() * (nodes.length - 1)) + 1;
+      const randomNode = nodes[randomNodeExcept0] as GossipNode;
       // Add listeners that receive new GossipMessages and push them to the MessageStore
       nodes.forEach((n) => {
         {
@@ -105,7 +107,11 @@ describe("gossip network tests", () => {
       let numCastAddMessages = 0;
 
       nonSenderNodes.map((n) => {
-        const topics = messageStore.get(n.peerId()?.toString() ?? "");
+        const peerId = n.peerId();
+        if (!peerId) {
+          throw new Error(`peerId is undefined for node: ${n}`);
+        }
+        const topics = messageStore.get(peerId.toString());
         expect(topics).toBeDefined();
         expect(topics?.has(primaryTopic)).toBeTruthy();
         const topicMessages = topics?.get(primaryTopic) ?? [];

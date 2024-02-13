@@ -20,7 +20,7 @@ import { profileStorageUsed } from "./profile/profile.js";
 import { profileRPCServer } from "./profile/rpcProfile.js";
 import { profileGossipServer } from "./profile/gossipProfile.js";
 import { initializeStatsd } from "./utils/statsd.js";
-import OnChainEventStore from "./storage/stores/onChainEventStore.js";
+import os from "os";
 import { startupCheck, StartupCheckStatus } from "./utils/startupCheck.js";
 import { mainnet, optimism } from "viem/chains";
 import { finishAllProgressBars } from "./utils/progressBars.js";
@@ -188,6 +188,20 @@ app
       `Farcaster: ${FARCASTER_VERSION} Hubble: ${APP_VERSION}`,
     );
 
+    // First, we'll check if we have >16G of RAM. If you have 16GB installed, it
+    // detects it as slightly under that depending on OS, so we'll only error if
+    // it's less than 15GB.
+    const totalMemory = Math.floor(os.totalmem() / 1024 / 1024 / 1024);
+    if (totalMemory < 15) {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.ERROR,
+        `Hubble requires at least 16GB of RAM to run. Detected ${totalMemory}GB`,
+      );
+      process.exit(1);
+    } else {
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Detected ${totalMemory}GB of RAM`);
+    }
+
     // We'll write our process number to a file so that we can detect if another hub process has taken over.
     const processFileDir = `${DB_DIRECTORY}/process/`;
     const processFilePrefix = cliOptions.processFilePrefix?.concat("_") ?? "";
@@ -221,7 +235,10 @@ app
 
         const readProcessNum = parseInt(data.trim());
         if (!isNaN(readProcessNum) && readProcessNum !== processNum) {
-          logger.error(`Another hub process is running with processNum ${readProcessNum}, exiting`);
+          logger.error(
+            { readProcessNum, processNum },
+            `Another hub process started up with processNum ${readProcessNum}, exiting with SIGTERM`,
+          );
           handleShutdownSignal("SIGTERM");
         }
       });
@@ -235,22 +252,20 @@ app
     // try to load the config file
     // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     let hubConfig: any = DefaultConfig;
-    if (cliOptions.config) {
-      if (!cliOptions.config.endsWith(".js")) {
+    const hubConfigFile = cliOptions.config || process.env["HUB_CONFIG"];
+    if (hubConfigFile) {
+      if (!hubConfigFile.endsWith(".js")) {
         startupCheck.printStartupCheckStatus(StartupCheckStatus.ERROR, "Config file must be a .js file");
-        throw new Error(`Config file ${cliOptions.config} must be a .js file`);
+        throw new Error(`Config file ${hubConfigFile} must be a .js file`);
       }
 
-      if (!fs.existsSync(resolve(cliOptions.config))) {
-        startupCheck.printStartupCheckStatus(
-          StartupCheckStatus.ERROR,
-          `Config file ${cliOptions.config} does not exist`,
-        );
-        throw new Error(`Config file ${cliOptions.config} does not exist`);
+      if (!fs.existsSync(resolve(hubConfigFile))) {
+        startupCheck.printStartupCheckStatus(StartupCheckStatus.ERROR, `Config file ${hubConfigFile} does not exist`);
+        throw new Error(`Config file ${hubConfigFile} does not exist`);
       }
 
-      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Loading config file ${cliOptions.config}`);
-      hubConfig = (await import(resolve(cliOptions.config))).Config;
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Loading config file ${hubConfigFile}`);
+      hubConfig = (await import(resolve(hubConfigFile))).Config;
     }
 
     const disableConsoleStatus = cliOptions.disableConsoleStatus ?? hubConfig.disableConsoleStatus ?? false;
@@ -408,11 +423,16 @@ app
       throw ipMultiAddrResult.error;
     }
 
-    const bootstrapAddrs = (
-      (cliOptions.bootstrap ??
-        hubConfig.bootstrap ??
-        (network === FarcasterNetwork.MAINNET ? MAINNET_BOOTSTRAP_PEERS : [])) as string[]
-    )
+    let bootstrapList = (cliOptions.bootstrap ?? hubConfig.bootstrap ?? []) as string[];
+    if (network === FarcasterNetwork.MAINNET) {
+      // Add in all the mainnet bootstrap peers
+      bootstrapList.push(...MAINNET_BOOTSTRAP_PEERS);
+
+      // deduplicate
+      bootstrapList = Array.from(new Set(bootstrapList));
+    }
+
+    const bootstrapAddrs = bootstrapList
       .map((a) => parseAddress(a))
       .map((a) => {
         if (a.isErr()) {
@@ -518,6 +538,7 @@ app
       enableSnapshotToS3,
       s3SnapshotBucket: cliOptions.s3SnapshotBucket ?? hubConfig.s3SnapshotBucket,
       hubOperatorFid: parseInt(cliOptions.hubOperatorFid ?? hubConfig.hubOperatorFid),
+      connectToDbPeers: hubConfig.connectToDbPeers ?? true,
     };
 
     // Startup check for Hub Operator FID
